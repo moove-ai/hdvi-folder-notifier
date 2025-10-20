@@ -1,0 +1,15 @@
+*.md
+.git
+.gitignore
+*.sh
+.env
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.pytest_cache
+.venv
+venv/
+
