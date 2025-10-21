@@ -17,8 +17,8 @@ app = Flask(__name__)
 # Configuration
 PROJECT_ID = os.environ.get("GCP_PROJECT", "moove-data-pipelines")
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
-BUCKET_NAME = "moove-incoming-data-u7x4ty"
-MONITORED_PREFIXES = ["Prebind/", "Postbind/", "test/"]
+BUCKET_NAME = os.environ.get("BUCKET_NAME", "moove-incoming-data-u7x4ty")
+MONITORED_PREFIXES = os.environ.get("MONITORED_PREFIXES", "Prebind/,Postbind/,test/").split(",")
 
 # Initialize Firestore to track notified folders
 db = firestore.Client(project=PROJECT_ID)
@@ -27,12 +27,13 @@ COLLECTION_NAME = "notified_folders"
 
 def get_folder_from_path(file_path: str) -> str:
     """
-    Extract the folder path from a file path.
-    Example: Prebind/2024/10/20/file.csv -> Prebind/2024/10/20
+    Extract the top-level monitored folder from a file path.
+    Example: Prebind/2024/10/20/file.csv -> Prebind
     """
-    parts = file_path.rsplit("/", 1)
-    if len(parts) > 1:
-        return parts[0]
+    # Find which monitored prefix this file belongs to
+    for prefix in MONITORED_PREFIXES:
+        if file_path.startswith(prefix):
+            return prefix
     return ""
 
 
@@ -47,7 +48,9 @@ def check_and_mark_folder(transaction, folder_path: str, timestamp: str) -> bool
     Atomically check if folder has been notified and mark it if not.
     Returns True if this is a new folder (should notify), False otherwise.
     """
-    doc_ref = db.collection(COLLECTION_NAME).document(folder_path)
+    # Encode folder path to make it a valid Firestore document ID
+    doc_id = folder_path.replace("/", "_").replace("\\", "_")
+    doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
     doc = doc_ref.get(transaction=transaction)
     
     if doc.exists:
@@ -57,7 +60,8 @@ def check_and_mark_folder(transaction, folder_path: str, timestamp: str) -> bool
     transaction.set(
         doc_ref,
         {
-            "folder": folder_path,
+            "folder_path": folder_path,
+            "doc_id": doc_id,
             "first_notification_time": timestamp,
             "notified_at": firestore.SERVER_TIMESTAMP,
         },
