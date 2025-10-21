@@ -1,0 +1,29 @@
+apiVersion: skaffold/v4beta7
+kind: Config
+metadata:
+  name: hdvi-folder-notifier
+
+deploy:
+  cloudrun: {}
+
+profiles:
+  - name: production
+    manifests:
+      rawYaml:
+        - service/production.yaml
+
+customActions:
+- name: production-slack
+  containers:
+  - name: production-slack
+    image: us-docker.pkg.dev/moove-build/docker-us/slack:latest
+    command: ["/bin/bash"]
+    args: 
+      - -c
+      - |
+        python /app/main.py \
+          --secret-id cicd_slack-production-deploys-hook \
+          --application-name "hdvi-folder-notifier" \
+          --release-name "$CLOUD_DEPLOY_RELEASE" \
+          --message ":bell: DEPLOYED: HDVI Folder Notifier - $CLOUD_RUN_LOCATION | $CLOUD_DEPLOY_RELEASE"
+

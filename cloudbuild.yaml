@@ -1,0 +1,77 @@
+# Cloud Build configuration for HDVI Folder Notifier
+# Runs in moove-build project, deploys to moove-data-pipelines
+
+logsBucket: 'moove-build-logs'
+timeout: '1200s'
+
+options:
+  automapSubstitutions: true
+  logging: GCS_ONLY
+  machineType: 'N1_HIGHCPU_8'
+  diskSizeGb: 100
+
+steps:
+  # Build container image with Docker BuildKit
+  - id: 'build'
+    name: 'gcr.io/cloud-builders/docker'
+    env:
+      - 'DOCKER_BUILDKIT=1'
+    args:
+      - 'build'
+      - '--cache-from'
+      - 'us-docker.pkg.dev/moove-build/docker-us/hdvi-folder-notifier:latest'
+      - '--build-arg'
+      - 'BUILDKIT_INLINE_CACHE=1'
+      - '-t'
+      - 'us-docker.pkg.dev/moove-build/docker-us/hdvi-folder-notifier:${_SHORT_SHA}'
+      - '-t'
+      - 'us-docker.pkg.dev/moove-build/docker-us/hdvi-folder-notifier:latest'
+      - '.'
+
+  # Push image with commit SHA tag
+  - id: 'push-sha'
+    name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'us-docker.pkg.dev/moove-build/docker-us/hdvi-folder-notifier:${_SHORT_SHA}'
+
+  # Push image with latest tag
+  - id: 'push-latest'
+    name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - 'us-docker.pkg.dev/moove-build/docker-us/hdvi-folder-notifier:latest'
+
+  # Apply Cloud Deploy delivery pipeline
+  - id: 'pipeline'
+    name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    script: |
+      #!/usr/bin/env bash
+      gcloud deploy apply \
+        --file clouddeploy.yaml \
+        --region us-central1 \
+        --project ${PROJECT_ID}
+
+  # Create Cloud Deploy release
+  - id: 'deploy'
+    name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    script: |
+      #!/usr/bin/env bash
+      echo "Creating release hdvi-folder-notifier-${_SHORT_SHA}-$(date +%s)"
+      gcloud deploy releases create hdvi-folder-notifier-${_SHORT_SHA}-$(date +%s) \
+        --delivery-pipeline hdvi-folder-notifier \
+        --region us-central1 \
+        --images app=us-docker.pkg.dev/moove-build/docker-us/hdvi-folder-notifier:${_SHORT_SHA} \
+        --description "${SHORT_SHA} - $(git log -1 --pretty=format:'%ae'): $(git log -1 --pretty=format:'%s')" \
+        --source .
+
+# Tags for organization
+tags:
+  - 'hdvi-folder-notifier'
+  - 'cloud-run'
+  - 'data-pipelines'
+
+# Substitutions
+substitutions:
+  _SHORT_SHA: 'manual'
+

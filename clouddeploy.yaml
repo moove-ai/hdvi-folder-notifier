@@ -1,0 +1,35 @@
+apiVersion: deploy.cloud.google.com/v1
+kind: DeliveryPipeline
+metadata:
+  name: hdvi-folder-notifier
+description: HDVI Folder Notifier Delivery Pipeline
+serialPipeline:
+  stages:
+    - targetId: production
+      profiles:
+        - production
+      strategy:
+        standard: {}
+---
+# Production Multi Target (multi-region)
+apiVersion: deploy.cloud.google.com/v1
+kind: Target
+metadata:
+  name: production
+description: HDVI Folder Notifier Production
+multiTarget:
+  targetIds: [production-us-central1]
+
+---
+# Production us-central1
+apiVersion: deploy.cloud.google.com/v1
+kind: Target
+metadata:
+  name: production-us-central1
+description: HDVI Folder Notifier Production (us-central1)
+run:
+  location: projects/moove-data-pipelines/locations/us-central1
+executionConfigs:
+  - usages: ['RENDER', 'PREDEPLOY', 'DEPLOY', 'VERIFY', 'POSTDEPLOY']
+    serviceAccount: deployer@moove-build.iam.gserviceaccount.com
+

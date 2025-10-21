@@ -27,12 +27,23 @@ COLLECTION_NAME = "notified_folders"
 
 def get_folder_from_path(file_path: str) -> str:
     """
-    Extract the top-level monitored folder from a file path.
-    Example: Prebind/2024/10/20/file.csv -> Prebind
+    Extract the specific subfolder from a file path within monitored prefixes.
+    Only returns a subfolder if there actually is one.
+    Example: test/subfolder/file.csv -> test/subfolder
+    Example: test/file.csv -> test (no subfolder)
     """
     # Find which monitored prefix this file belongs to
     for prefix in MONITORED_PREFIXES:
         if file_path.startswith(prefix):
+            # Remove the prefix and get the next path component (subfolder)
+            relative_path = file_path[len(prefix):].lstrip('/')
+            if relative_path:
+                # Get the first path component after the prefix
+                subfolder = relative_path.split('/')[0]
+                # Only return subfolder if it's not a file (has no extension or is a directory)
+                if '.' not in subfolder or subfolder.count('/') > 0:
+                    return f"{prefix}/{subfolder}"
+            # If no subfolder or it's a file directly in the prefix, return just the prefix
             return prefix
     return ""
 

@@ -1,0 +1,6 @@
+# Example Terraform variables file
+# Copy this to terraform/terraform.tfvars.secret for sensitive values
+
+# Slack webhook URL (sensitive - don't commit this file!)
+slack_webhook_url = "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+

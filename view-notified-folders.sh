@@ -9,11 +9,13 @@ echo "📁 Notified folders in Firestore:"
 echo "=================================="
 echo ""
 
-# List all documents in the collection
-gcloud firestore documents list "${COLLECTION}" \
+# List all documents in the collection using REST API
+echo "Querying Firestore for notified folders..."
+gcloud firestore databases documents list \
   --project="${PROJECT_ID}" \
-  --format="table(name,createTime)" \
-  --sort-by="createTime"
+  --database="(default)" \
+  --collection="${COLLECTION}" \
+  --format="table(name,fields.folder_path.stringValue,fields.first_notification_time.stringValue,fields.notified_at.timestampValue)"
 
 echo ""
 echo "To view details of a specific folder:"

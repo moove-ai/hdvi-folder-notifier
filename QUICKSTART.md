@@ -1,16 +1,31 @@
 # HDVI Folder Notifier - Quick Start
 
-## One-Command Setup
+## One-Command Deployment
 
 ```bash
-./setup-all.sh "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+gcloud builds submit --project=moove-build --config=cloudbuild.yaml .
 ```
 
-That's it! This will:
-1. Store Slack webhook in Secret Manager
-2. Configure Firestore permissions  
-3. Deploy the Cloud Run service
-4. Create the Pub/Sub subscription
+This builds and deploys via Cloud Deploy. First-time setup also requires:
+
+```bash
+# 1. Deploy infrastructure (Firestore, Pub/Sub, secrets)
+cd terraform && terraform init && terraform apply
+
+# 2. Add Slack webhook
+# Add your Slack webhook URL to Secret Manager
+gcloud secrets create hdvi-folder-notifier-slack-webhook \
+  --project=moove-data-pipelines \
+  --data-file=- <<< "YOUR_WEBHOOK_URL"
+
+# 3. Deploy service
+gcloud builds submit --project=moove-build --config=cloudbuild.yaml .
+```
+
+## Architecture
+
+**Service Deployment**: Cloud Deploy (like moove-webservice)
+**Infrastructure**: Terraform (Firestore, Pub/Sub, IAM)
 
 ## Test It
 
@@ -40,31 +55,41 @@ Check your Slack channel for the notification!
 
 ## Manual Steps (if needed)
 
-### Create Firestore Database
-
-If Firestore doesn't exist:
+### Deploy Infrastructure Only
 
 ```bash
-gcloud firestore databases create \
-  --project=moove-data-pipelines \
-  --location=us-central1 \
-  --type=firestore-native
+cd terraform && terraform init && terraform apply
 ```
 
-### Individual Setup Steps
+Or manually:
+```bash
+cd terraform
+terraform init
+terraform plan
+terraform apply
+```
+
+### Build and Deploy Service Only
 
 ```bash
-# 1. Store Slack webhook
-./setup-secrets.sh "YOUR_WEBHOOK_URL"
+gcloud builds submit --project=moove-build --config=cloudbuild.yaml
+```
 
-# 2. Configure Firestore
-./setup-firestore.sh
+This builds the image and triggers Cloud Deploy.
 
-# 3. Deploy service
-./deploy.sh
+### Manage Slack Webhook
 
-# 4. Create subscription
-./setup-pubsub.sh
+```bash
+# Add webhook (via helper script)
+# Add your Slack webhook URL to Secret Manager
+gcloud secrets create hdvi-folder-notifier-slack-webhook \
+  --project=moove-data-pipelines \
+  --data-file=- <<< "YOUR_WEBHOOK_URL"
+
+# Or directly
+echo -n "YOUR_WEBHOOK_URL" | gcloud secrets versions add hdvi-folder-notifier-slack-webhook \
+  --project=moove-data-pipelines \
+  --data-file=-
 ```
 
 ## Troubleshooting

@@ -21,7 +21,7 @@ hdvi-folder-notifier/
 │
 ├── setup-all.sh                # One-command setup (recommended)
 ├── deploy.sh                   # Deploy Cloud Run service
-├── setup-secrets.sh            # Configure Slack webhook
+# Note: Slack webhook configured manually via gcloud secrets
 ├── setup-firestore.sh          # Configure Firestore
 ├── setup-pubsub.sh            # Create Pub/Sub subscription
 │
@@ -86,27 +86,37 @@ hdvi-folder-notifier/
 
 ## Deployment Steps
 
-### Quick Deployment (Recommended)
+### One-Command Deployment (Recommended)
 
 ```bash
 cd /Users/m1/moove-repos/hdvi-folder-notifier
-./setup-all.sh "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+gcloud builds submit --project=moove-build --config=cloudbuild.yaml .
+```
+
+Then add Slack webhook:
+```bash
+# Add your Slack webhook URL to Secret Manager
+gcloud secrets create hdvi-folder-notifier-slack-webhook \
+  --project=moove-data-pipelines \
+  --data-file=- <<< "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
 ```
 
 ### Manual Deployment
 
 ```bash
-# 1. Configure secrets
-./setup-secrets.sh "YOUR_WEBHOOK_URL"
+# 1. Build image
+gcloud builds submit --config=cloudbuild.yaml
 
-# 2. Setup Firestore
-./setup-firestore.sh
+# 2. Deploy with Terraform
+cd terraform
+terraform init
+terraform apply
 
-# 3. Deploy service
-./deploy.sh
-
-# 4. Create subscription
-./setup-pubsub.sh
+# 3. Add webhook
+# Add your Slack webhook URL to Secret Manager
+gcloud secrets create hdvi-folder-notifier-slack-webhook \
+  --project=moove-data-pipelines \
+  --data-file=- <<< "YOUR_WEBHOOK_URL"
 ```
 
 ## Testing
@@ -192,7 +202,10 @@ gcloud firestore documents delete --all-collections \
 
 ### Update Slack Webhook
 ```bash
-./setup-secrets.sh "NEW_WEBHOOK_URL"
+# Update your Slack webhook URL in Secret Manager
+gcloud secrets versions add hdvi-folder-notifier-slack-webhook \
+  --project=moove-data-pipelines \
+  --data-file=- <<< "NEW_WEBHOOK_URL"
 gcloud run services update hdvi-folder-notifier \
   --project=moove-data-pipelines \
   --region=us-central1

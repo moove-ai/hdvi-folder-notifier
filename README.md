@@ -32,56 +32,113 @@ Slack Channel
 
 ## Deployment
 
-### Step 1: Set up Secrets
+Uses Cloud Deploy for service deployment (like moove-webservice) and Terraform for infrastructure.
 
-Store your Slack webhook URL in Secret Manager:
+### Architecture
 
+- **Service Deployment**: Cloud Deploy + Cloud Build
+- **Infrastructure**: Terraform (Firestore, Pub/Sub, IAM)
+- **Configuration**: `service/production.yaml`
+
+### Quick Deployment
+
+#### First Time Setup
+
+1. Deploy infrastructure:
 ```bash
-./setup-secrets.sh "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
+cd terraform
+terraform init
+terraform apply
 ```
 
-### Step 2: Set up Firestore
-
-Ensure Firestore is configured and grant necessary permissions:
-
+2. Add Slack webhook:
 ```bash
-./setup-firestore.sh
-```
-
-If Firestore database doesn't exist, you'll need to create it first:
-
-```bash
-gcloud firestore databases create \
+# Add your Slack webhook URL to Secret Manager
+gcloud secrets create hdvi-folder-notifier-slack-webhook \
   --project=moove-data-pipelines \
-  --location=us-central1 \
-  --type=firestore-native
+  --data-file=- <<< "YOUR_WEBHOOK_URL"
 ```
 
-### Step 3: Deploy the Cloud Run Service
+3. Deploy service:
+```bash
+# Automatic: Push to main branch (if triggers enabled)
+git push origin main
 
-Build and deploy the service:
+# Manual: Trigger Cloud Build
+gcloud builds submit --project=moove-build --config=cloudbuild.yaml .
+```
+
+#### Subsequent Deployments
+
+With Cloud Build triggers enabled:
+- **Push to main**: Automatic build + deploy
+- **Pull Request**: Automatic build + deploy for testing
+
+Manual deployment:
+```bash
+gcloud builds submit --project=moove-build --config=cloudbuild.yaml .
+```
+
+### Manual Deployment
+
+#### Step 1: Deploy Infrastructure
 
 ```bash
-./deploy.sh
+cd terraform
+terraform init
+terraform plan
+terraform apply
 ```
 
-This will:
-- Build the Docker container using Cloud Build
-- Deploy to Cloud Run in `us-central1`
-- Configure environment variables and secrets
+This creates:
+- Firestore database
+- Secret Manager secrets
+- Pub/Sub subscription
+- IAM bindings
 
-### Step 4: Set up Pub/Sub Subscription
-
-Create the push subscription to the existing topic:
+#### Step 2: Add Secrets
 
 ```bash
-./setup-pubsub.sh
+# Add your Slack webhook URL to Secret Manager
+gcloud secrets create hdvi-folder-notifier-slack-webhook \
+  --project=moove-data-pipelines \
+  --data-file=- <<< "https://hooks.slack.com/services/YOUR/WEBHOOK/URL"
 ```
 
-This will:
-- Create a service account for Pub/Sub to invoke Cloud Run
-- Grant necessary permissions
-- Create the push subscription
+#### Step 3: Build and Deploy Service
+
+```bash
+gcloud builds submit \
+  --project=moove-build \
+  --config=cloudbuild.yaml
+```
+
+This:
+1. Builds container image
+2. Pushes to Artifact Registry
+3. Triggers Cloud Deploy
+4. Deploys to Cloud Run
+
+### Service Configuration
+
+Service configuration is in `service/production.yaml`:
+- Memory, CPU limits
+- Environment variables
+- Health checks
+- Scaling parameters
+
+To change service config:
+1. Edit `service/production.yaml`
+2. Run `gcloud builds submit --project=moove-build --config=cloudbuild.yaml .`
+
+### Benefits
+
+- **Separation of Concerns**: Service vs infrastructure
+- **Cloud Deploy**: Standard deployment pipeline with rollbacks
+- **Version Control**: Service config alongside code
+- **Consistent**: Follows moove-webservice pattern
+
+See [terraform/README.md](terraform/README.md) for Terraform details.
 
 ## Configuration
 
@@ -89,15 +146,22 @@ This will:
 
 - `GCP_PROJECT`: GCP project ID (default: `moove-data-pipelines`)
 - `SLACK_WEBHOOK_URL`: Slack webhook URL (loaded from Secret Manager)
+- `BUCKET_NAME`: GCS bucket to monitor (default: `moove-incoming-data-u7x4ty`)
+- `MONITORED_PREFIXES`: Comma-separated folder prefixes to monitor (default: `Prebind/,Postbind/,test/`)
 
 ### Monitored Paths
 
-The service monitors these prefixes in the bucket:
+By default, the service monitors these prefixes:
 - `Prebind/`
 - `Postbind/`
 - `test/`
 
-Files outside these paths are ignored.
+Files outside these paths are ignored. You can customize this in `terraform/terraform.tfvars`:
+
+```hcl
+bucket_name        = "your-bucket-name"
+monitored_prefixes = "Folder1/,Folder2/,Folder3/"
+```
 
 ### Folder Tracking
 
@@ -200,7 +264,17 @@ Consider setting up alerts for:
 Make code changes and redeploy:
 
 ```bash
-./deploy.sh
+gcloud builds submit --project=moove-build --config=cloudbuild.yaml .
+```
+
+Or manually:
+```bash
+# Build new image
+gcloud builds submit --config=cloudbuild.yaml
+
+# Update Terraform
+cd terraform
+terraform apply
 ```
 
 The Pub/Sub subscription will automatically use the new deployment.
@@ -208,16 +282,13 @@ The Pub/Sub subscription will automatically use the new deployment.
 ### Update Slack Webhook
 
 ```bash
-./setup-secrets.sh "NEW_WEBHOOK_URL"
-```
-
-Then restart the service:
-
-```bash
-gcloud run services update hdvi-folder-notifier \
+# Update your Slack webhook URL in Secret Manager
+gcloud secrets versions add hdvi-folder-notifier-slack-webhook \
   --project=moove-data-pipelines \
-  --region=us-central1
+  --data-file=- <<< "NEW_WEBHOOK_URL"
 ```
+
+Cloud Run automatically picks up the new secret version (configured to use "latest").
 
 ### Clear Notification History
 
