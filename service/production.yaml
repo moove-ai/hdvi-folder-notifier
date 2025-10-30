@@ -33,7 +33,7 @@ spec:
         - name: SLACK_BOT_TOKEN
           valueFrom:
             secretKeyRef:
-              name: hdvi-folder-notifier-slack-bot-token
+              name: hdvi-slack-notifier-bot-token
               key: latest
         
         resources:
