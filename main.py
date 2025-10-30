@@ -121,6 +121,35 @@ def check_and_mark_folder(transaction, folder_path: str, timestamp: str) -> bool
     return True  # New folder, should notify
 
 
+@firestore.transactional
+def check_and_mark_final(transaction, folder_path: str, file_count: int, total_size: int) -> bool:
+    """
+    Atomically check if final notification was already sent; if not, mark it with stats.
+    Returns True if we should send final notification/edit now, False otherwise.
+    """
+    doc_id = folder_path.replace("/", "_").replace("\\", "_")
+    doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
+    doc = doc_ref.get(transaction=transaction)
+
+    if doc.exists and doc.get("final_notification_sent"):
+        return False
+
+    # Mark final as sent and store stats
+    transaction.set(
+        doc_ref,
+        {
+            "folder_path": folder_path,
+            "doc_id": doc_id,
+            "final_notification_sent": True,
+            "final_notification_time": firestore.SERVER_TIMESTAMP,
+            "file_count": file_count,
+            "total_size_bytes": total_size,
+        },
+        merge=True,
+    )
+    return True
+
+
 def _slack_api_post(path: str, payload: Dict) -> Dict:
     url = f"https://slack.com/api/{path}"
     headers = {
@@ -265,10 +294,12 @@ def send_final_slack_notification(folder_path: str, file_count: int, total_size:
                 logger.info(f"Edited Slack message ts={ts} channel={channel} for folder: {folder_path} with file_count={file_count} total_size={total_size}")
                 return True
         except Exception as e:
-            logger.error(f"Failed to edit Slack message, will fallback to webhook: {e}")
+            # Do NOT fallback to webhook when bot token is configured; avoid double messages
+            logger.error(f"Failed to edit Slack message: {e}")
+            return False
 
-    # Fallback: send a second webhook message (if configured)
-    if SLACK_WEBHOOK_URL:
+    # Fallback: only when no bot token configured
+    if not SLACK_BOT_TOKEN and SLACK_WEBHOOK_URL:
         try:
             message = {"text": f"✅ Folder upload complete: {folder_path}", "blocks": final_blocks}
             response = requests.post(SLACK_WEBHOOK_URL, json=message, timeout=10)
@@ -357,21 +388,19 @@ def monitor_folder(folder_path: str):
                 # Get folder statistics
                 file_count, total_size = get_folder_stats(folder_path)
                 
-                # Send final notification
-                send_final_slack_notification(folder_path, file_count, total_size)
-                
-                # Mark as complete in Firestore
+                # Idempotent final-send gate using Firestore
                 try:
-                    doc_id = folder_path.replace("/", "_").replace("\\", "_")
-                    doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
-                    doc_ref.update({
-                        "final_notification_sent": True,
-                        "final_notification_time": firestore.SERVER_TIMESTAMP,
-                        "file_count": file_count,
-                        "total_size_bytes": total_size,
-                    })
+                    transaction = db.transaction()
+                    should_send_final = check_and_mark_final(transaction, folder_path, file_count, total_size)
                 except Exception as e:
-                    logger.error(f"Error updating Firestore for {folder_path}: {e}")
+                    logger.error(f"Error checking/marking final notification for {folder_path}: {e}")
+                    should_send_final = False
+
+                if should_send_final:
+                    # Send final notification (edit or webhook depending on config)
+                    send_final_slack_notification(folder_path, file_count, total_size)
+                
+                # Else: another instance already sent the final, skip sending
                 
                 # Remove from monitoring
                 with monitored_folders_lock:
