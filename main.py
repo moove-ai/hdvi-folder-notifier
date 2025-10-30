@@ -199,9 +199,14 @@ def send_slack_notification(folder_path: str, timestamp: str) -> bool:
             logger.info(f"Slack message posted with ts={ts} for folder: {folder_path}")
             return True
         except Exception as e:
-            logger.error(f"Failed Slack Web API post, falling back to webhook: {e}")
+            # Do NOT fallback to webhook when bot token is configured; avoid duplicate messages
+            logger.error(f"Failed Slack Web API post: {e}")
+            return False
 
-    # Fallback to webhook (cannot edit later)
+    # Fallback to webhook (cannot edit later) only when bot token not configured
+    if SLACK_BOT_TOKEN:
+        # Bot is configured but post failed above; do not send webhook fallback
+        return False
     if not SLACK_WEBHOOK_URL:
         logger.warning("SLACK_WEBHOOK_URL not configured, skipping webhook notification")
         return False
