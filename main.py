@@ -25,6 +25,10 @@ SLACK_CHANNEL = os.environ.get("SLACK_CHANNEL", "")
 BUCKET_NAME = os.environ.get("BUCKET_NAME", "moove-incoming-data-u7x4ty")
 MONITORED_PREFIXES = os.environ.get("MONITORED_PREFIXES", "Prebind/,Postbind/,test/").split(",")
 
+# Optional analytics CSV sink in GCS
+ANALYTICS_BUCKET = os.environ.get("ANALYTICS_BUCKET", "")
+ANALYTICS_OBJECT = os.environ.get("ANALYTICS_OBJECT", "")
+
 # Initialize Firestore to track notified folders
 db = firestore.Client(project=PROJECT_ID)
 COLLECTION_NAME = "notified_folders"
@@ -323,6 +327,55 @@ def send_final_slack_notification(folder_path: str, file_count: int, total_size:
     return False
 
 
+def _append_completion_csv(folder_path: str, first_time: str, final_time_iso: str, file_count: int, total_size: int) -> None:
+    """Append a CSV row to GCS object with folder completion stats. Best-effort with generation precondition retries."""
+    if not ANALYTICS_BUCKET or not ANALYTICS_OBJECT:
+        return
+
+    try:
+        import csv
+        from io import StringIO
+
+        bucket = storage_client.bucket(ANALYTICS_BUCKET)
+        blob = bucket.blob(ANALYTICS_OBJECT)
+
+        # Build row via csv writer
+        buf = StringIO()
+        writer = csv.writer(buf)
+        writer.writerow([folder_path, first_time or "", final_time_iso, str(file_count), str(total_size)])
+        row_bytes = buf.getvalue()
+
+        # If object does not exist, write header + row
+        if not blob.exists():
+            header_buf = StringIO()
+            writer_h = csv.writer(header_buf)
+            writer_h.writerow(["folder_path", "first_notification_time", "final_notification_time", "file_count", "total_size_bytes"])
+            data = header_buf.getvalue() + row_bytes
+            blob.upload_from_string(data, content_type="text/csv")
+            logger.info(f"Created analytics CSV with first row for {folder_path}")
+            return
+
+        # Else: read-modify-write with generation precondition
+        retries = 3
+        for attempt in range(retries):
+            blob.reload()
+            gen = blob.generation
+            existing = blob.download_as_text()
+            new_data = existing + row_bytes
+            try:
+                blob.upload_from_string(new_data, content_type="text/csv", if_generation_match=gen)
+                logger.info(f"Appended analytics CSV row for {folder_path}")
+                return
+            except Exception as e:
+                if attempt < retries - 1:
+                    time.sleep(0.2)
+                    continue
+                logger.error(f"Failed to append analytics CSV for {folder_path}: {e}")
+                return
+    except Exception as e:
+        logger.error(f"Analytics CSV error for {folder_path}: {e}")
+
+
 def check_folder_for_new_files(folder_path: str) -> bool:
     """
     Check if there are new files in the folder since last check.
@@ -408,6 +461,18 @@ def monitor_folder(folder_path: str):
                 if should_send_final:
                     # Send final notification (edit or webhook depending on config)
                     send_final_slack_notification(folder_path, file_count, total_size)
+                    # Write analytics CSV (best-effort)
+                    try:
+                        # Retrieve first notification time from Firestore for row
+                        doc_id = folder_path.replace("/", "_").replace("\\", "_")
+                        doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
+                        doc = doc_ref.get()
+                        data = doc.to_dict() or {}
+                        first_time = data.get("first_notification_time") or ""
+                        final_time_iso = datetime.utcnow().isoformat()
+                        _append_completion_csv(folder_path, first_time, final_time_iso, file_count, total_size)
+                    except Exception as e:
+                        logger.error(f"Failed to write analytics CSV for {folder_path}: {e}")
                 
                 # Else: another instance already sent the final, skip sending
                 
