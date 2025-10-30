@@ -29,7 +29,7 @@ spec:
         - name: MONITORED_PREFIXES
           value: Prebind/,Postbind/,test/
         - name: SLACK_CHANNEL
-          value: C0123456789   # your channel ID
+          value: C09MKS35S74
         - name: SLACK_BOT_TOKEN
           valueFrom:
             secretKeyRef:
