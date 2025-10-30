@@ -2,11 +2,14 @@ import base64
 import json
 import os
 import logging
+import threading
+import time
 from datetime import datetime
-from typing import Dict, Set
+from typing import Dict, Tuple
 from flask import Flask, request, jsonify
 import requests
 from google.cloud import firestore
+from google.cloud import storage
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -17,12 +20,45 @@ app = Flask(__name__)
 # Configuration
 PROJECT_ID = os.environ.get("GCP_PROJECT", "moove-data-pipelines")
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
+SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
+SLACK_CHANNEL = os.environ.get("SLACK_CHANNEL", "")
 BUCKET_NAME = os.environ.get("BUCKET_NAME", "moove-incoming-data-u7x4ty")
 MONITORED_PREFIXES = os.environ.get("MONITORED_PREFIXES", "Prebind/,Postbind/,test/").split(",")
 
 # Initialize Firestore to track notified folders
 db = firestore.Client(project=PROJECT_ID)
 COLLECTION_NAME = "notified_folders"
+
+# Initialize GCS client
+storage_client = storage.Client(project=PROJECT_ID)
+bucket_client = storage_client.bucket(BUCKET_NAME)
+
+# Folder monitoring state
+# Maps folder_path -> {"last_update": datetime, "known_files": set, "monitoring_thread": Thread}
+monitored_folders: Dict[str, Dict] = {}
+monitored_folders_lock = threading.Lock()
+
+# Monitoring configuration
+CHECK_INTERVAL_SECONDS = 15
+INACTIVITY_TIMEOUT_SECONDS = 60
+
+
+def _update_slack_metadata_with_retry(doc_id: str, ts: str, channel: str, retries: int = 3) -> None:
+    """Best-effort save of Slack message identifiers to Firestore to enable later edits."""
+    last_err = None
+    for _ in range(retries):
+        try:
+            doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
+            doc_ref.update({
+                "slack_message_ts": ts,
+                "slack_channel": channel,
+            })
+            return
+        except Exception as e:
+            last_err = e
+            time.sleep(0.2)
+    if last_err:
+        logger.error(f"Failed to save Slack message metadata after retries for doc {doc_id}: {last_err}")
 
 
 def get_folder_from_path(file_path: str) -> str:
@@ -36,15 +72,17 @@ def get_folder_from_path(file_path: str) -> str:
     for prefix in MONITORED_PREFIXES:
         if file_path.startswith(prefix):
             # Remove the prefix and get the next path component (subfolder)
+            # Normalize to ensure we don't create double slashes later
+            norm_prefix = prefix.rstrip('/')
             relative_path = file_path[len(prefix):].lstrip('/')
             if relative_path:
                 # Get the first path component after the prefix
                 subfolder = relative_path.split('/')[0]
                 # Only return subfolder if it's not a file (has no extension or is a directory)
                 if '.' not in subfolder or subfolder.count('/') > 0:
-                    return f"{prefix}/{subfolder}"
+                    return f"{norm_prefix}/{subfolder.strip('/')}"
             # If no subfolder or it's a file directly in the prefix, return just the prefix
-            return prefix
+            return norm_prefix
     return ""
 
 
@@ -75,42 +113,301 @@ def check_and_mark_folder(transaction, folder_path: str, timestamp: str) -> bool
             "doc_id": doc_id,
             "first_notification_time": timestamp,
             "notified_at": firestore.SERVER_TIMESTAMP,
+            # Slack message linkage (optional, when using Slack Web API)
+            "slack_message_ts": None,
+            "slack_channel": SLACK_CHANNEL or None,
         },
     )
     return True  # New folder, should notify
 
 
+def _slack_api_post(path: str, payload: Dict) -> Dict:
+    url = f"https://slack.com/api/{path}"
+    headers = {
+        "Authorization": f"Bearer {SLACK_BOT_TOKEN}",
+        "Content-Type": "application/json;charset=utf-8",
+    }
+    resp = requests.post(url, headers=headers, json=payload, timeout=10)
+    resp.raise_for_status()
+    data = resp.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"Slack API error for {path}: {data}")
+    return data
+
+
 def send_slack_notification(folder_path: str, timestamp: str) -> bool:
-    """Send notification to Slack."""
+    """Send initial notification to Slack. If bot token/channel are set, use chat.postMessage and store ts; else fallback to webhook."""
+    blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "📁 New HDVI Data Folder"},
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Folder:*\n`{BUCKET_NAME}/{folder_path}`"},
+                {"type": "mrkdwn", "text": f"*First File Time:*\n{timestamp}"},
+            ],
+        },
+    ]
+
+    # Prefer Slack Web API when configured
+    if SLACK_BOT_TOKEN and SLACK_CHANNEL:
+        try:
+            res = _slack_api_post(
+                "chat.postMessage",
+                {
+                    "channel": SLACK_CHANNEL,
+                    "text": f"New folder: {BUCKET_NAME}/{folder_path}",
+                    "blocks": blocks,
+                },
+            )
+            ts = res.get("ts")
+            channel = res.get("channel") or SLACK_CHANNEL
+            doc_id = folder_path.replace("/", "_").replace("\\", "_")
+            if ts and channel:
+                _update_slack_metadata_with_retry(doc_id, ts, channel)
+            logger.info(f"Slack message posted with ts={ts} for folder: {folder_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed Slack Web API post, falling back to webhook: {e}")
+
+    # Fallback to webhook (cannot edit later)
     if not SLACK_WEBHOOK_URL:
-        logger.warning("SLACK_WEBHOOK_URL not configured, skipping notification")
+        logger.warning("SLACK_WEBHOOK_URL not configured, skipping webhook notification")
         return False
 
-    message = {
-        "text": f"🆕 New folder detected in HDVI data",
-        "blocks": [
-            {
-                "type": "header",
-                "text": {"type": "plain_text", "text": "📁 New HDVI Data Folder"},
-            },
-            {
-                "type": "section",
-                "fields": [
-                    {"type": "mrkdwn", "text": f"*Folder:*\n`{BUCKET_NAME}/{folder_path}`"},
-                    {"type": "mrkdwn", "text": f"*First File Time:*\n{timestamp}"},
-                ],
-            },
-        ],
-    }
-
+    message = {"text": f"🆕 New folder detected in HDVI data", "blocks": blocks}
     try:
         response = requests.post(SLACK_WEBHOOK_URL, json=message, timeout=10)
         response.raise_for_status()
         logger.info(f"Slack notification sent for folder: {folder_path}")
         return True
     except Exception as e:
-        logger.error(f"Failed to send Slack notification: {e}")
+        logger.error(f"Failed to send Slack notification via webhook: {e}")
         return False
+
+
+def get_folder_stats(folder_path: str) -> Tuple[int, int]:
+    """
+    Get statistics for a folder.
+    Returns: (count of jsonl.gz files, total size in bytes)
+    """
+    try:
+        # List all blobs with the folder prefix (use client-level listing for robustness)
+        prefix = f"{folder_path}/" if not folder_path.endswith("/") else folder_path
+        blobs = storage_client.list_blobs(BUCKET_NAME, prefix=prefix)
+
+        jsonl_gz_count = 0
+        total_size = 0
+
+        for blob in blobs:
+            # Count any files anywhere under the folder (including subfolders)
+            if not blob.name.endswith('/') and blob.name.endswith('.jsonl.gz'):
+                jsonl_gz_count += 1
+                total_size += blob.size
+        
+        return jsonl_gz_count, total_size
+    except Exception as e:
+        logger.error(f"Error getting folder stats for {folder_path}: {e}")
+        return 0, 0
+
+
+def format_size(size_bytes: int) -> str:
+    """Format size in human-readable format."""
+    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+        if size_bytes < 1024.0:
+            return f"{size_bytes:.2f} {unit}"
+        size_bytes /= 1024.0
+    return f"{size_bytes:.2f} PB"
+
+
+def send_final_slack_notification(folder_path: str, file_count: int, total_size: int) -> bool:
+    """Edit the original Slack message with final statistics when possible; else send a second message via webhook."""
+    size_str = format_size(total_size)
+    final_blocks = [
+        {
+            "type": "header",
+            "text": {"type": "plain_text", "text": "✅ HDVI Folder Upload Complete"},
+        },
+        {
+            "type": "section",
+            "fields": [
+                {"type": "mrkdwn", "text": f"*Folder:*\n`{BUCKET_NAME}/{folder_path}`"},
+                {"type": "mrkdwn", "text": f"*JSONL.GZ Files:*\n{file_count}"},
+                {"type": "mrkdwn", "text": f"*Total Size:*\n{size_str}"},
+            ],
+        },
+    ]
+
+    # Prefer editing the original message when token/channel + ts exist
+    if SLACK_BOT_TOKEN:
+        try:
+            doc_id = folder_path.replace("/", "_").replace("\\", "_")
+            doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
+            doc = doc_ref.get()
+            ts = (doc.exists and doc.get("slack_message_ts")) or None
+            channel = (doc.exists and doc.get("slack_channel")) or SLACK_CHANNEL
+            if ts and channel:
+                _slack_api_post(
+                    "chat.update",
+                    {
+                        "channel": channel,
+                        "ts": ts,
+                        "text": f"Folder complete: {BUCKET_NAME}/{folder_path}",
+                        "blocks": final_blocks,
+                    },
+                )
+                logger.info(f"Edited Slack message ts={ts} for folder: {folder_path}")
+                return True
+        except Exception as e:
+            logger.error(f"Failed to edit Slack message, will fallback to webhook: {e}")
+
+    # Fallback: send a second webhook message (if configured)
+    if SLACK_WEBHOOK_URL:
+        try:
+            message = {"text": f"✅ Folder upload complete: {folder_path}", "blocks": final_blocks}
+            response = requests.post(SLACK_WEBHOOK_URL, json=message, timeout=10)
+            response.raise_for_status()
+            logger.info(f"Final Slack notification sent (webhook) for folder: {folder_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send final Slack notification via webhook: {e}")
+            return False
+
+    logger.warning("No Slack mechanism configured for final notification")
+    return False
+
+
+def check_folder_for_new_files(folder_path: str) -> bool:
+    """
+    Check if there are new files in the folder since last check.
+    Returns True if new files were found, False otherwise.
+    """
+    try:
+        prefix = f"{folder_path}/" if not folder_path.endswith("/") else folder_path
+        blobs = storage_client.list_blobs(BUCKET_NAME, prefix=prefix)
+        
+        with monitored_folders_lock:
+            if folder_path not in monitored_folders:
+                return False
+            
+            known_files = monitored_folders[folder_path]["known_files"]
+            found_new = False
+            
+            for blob in blobs:
+                # Consider any non-directory blob under the prefix
+                if not blob.name.endswith('/'):
+                    if blob.name not in known_files:
+                        known_files.add(blob.name)
+                        found_new = True
+                        logger.debug(f"New file detected in {folder_path}: {blob.name}")
+            
+            if found_new:
+                monitored_folders[folder_path]["last_update"] = datetime.utcnow()
+            
+            return found_new
+    except Exception as e:
+        logger.error(f"Error checking folder {folder_path} for new files: {e}")
+        return False
+
+
+def monitor_folder(folder_path: str):
+    """
+    Monitor a folder at 15-second intervals.
+    After 1 minute of inactivity, send final notification and stop monitoring.
+    """
+    logger.info(f"Starting monitoring for folder: {folder_path}")
+    
+    try:
+        while True:
+            time.sleep(CHECK_INTERVAL_SECONDS)
+            
+            with monitored_folders_lock:
+                if folder_path not in monitored_folders:
+                    logger.info(f"Folder {folder_path} removed from monitoring")
+                    break
+                
+                folder_state = monitored_folders[folder_path]
+                last_update = folder_state["last_update"]
+            
+            # Check for new files
+            found_new = check_folder_for_new_files(folder_path)
+            
+            if found_new:
+                logger.debug(f"New files found in {folder_path}, continuing monitoring")
+                continue
+            
+            # Check if we've passed the inactivity timeout
+            now = datetime.utcnow()
+            time_since_last_update = (now - last_update).total_seconds()
+            
+            if time_since_last_update >= INACTIVITY_TIMEOUT_SECONDS:
+                logger.info(f"No new files in {folder_path} for {INACTIVITY_TIMEOUT_SECONDS}s, preparing final notification")
+                
+                # Get folder statistics
+                file_count, total_size = get_folder_stats(folder_path)
+                
+                # Send final notification
+                send_final_slack_notification(folder_path, file_count, total_size)
+                
+                # Mark as complete in Firestore
+                try:
+                    doc_id = folder_path.replace("/", "_").replace("\\", "_")
+                    doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
+                    doc_ref.update({
+                        "final_notification_sent": True,
+                        "final_notification_time": firestore.SERVER_TIMESTAMP,
+                        "file_count": file_count,
+                        "total_size_bytes": total_size,
+                    })
+                except Exception as e:
+                    logger.error(f"Error updating Firestore for {folder_path}: {e}")
+                
+                # Remove from monitoring
+                with monitored_folders_lock:
+                    monitored_folders.pop(folder_path, None)
+                
+                logger.info(f"Stopped monitoring folder: {folder_path}")
+                break
+                
+    except Exception as e:
+        logger.error(f"Error in monitoring thread for {folder_path}: {e}", exc_info=True)
+        with monitored_folders_lock:
+            monitored_folders.pop(folder_path, None)
+
+
+def start_folder_monitoring(folder_path: str, initial_file: str):
+    """
+    Start monitoring a folder in a background thread.
+    """
+    with monitored_folders_lock:
+        if folder_path in monitored_folders:
+            # Already monitoring, just update the last update time
+            monitored_folders[folder_path]["last_update"] = datetime.utcnow()
+            monitored_folders[folder_path]["known_files"].add(initial_file)
+            logger.debug(f"Updated monitoring for existing folder: {folder_path}")
+            return
+        
+        # Start new monitoring
+        folder_state = {
+            "last_update": datetime.utcnow(),
+            "known_files": {initial_file},
+            "monitoring_thread": None,
+        }
+        monitored_folders[folder_path] = folder_state
+        
+        # Start monitoring thread
+        thread = threading.Thread(
+            target=monitor_folder,
+            args=(folder_path,),
+            daemon=True,
+            name=f"monitor-{folder_path}"
+        )
+        thread.start()
+        folder_state["monitoring_thread"] = thread
+        
+        logger.info(f"Started monitoring thread for folder: {folder_path}")
 
 
 @app.route("/", methods=["POST"])
@@ -163,8 +460,28 @@ def handle_pubsub_push():
                         else:
                             logger.warning(f"Failed to send Slack notification for folder: {folder_path}")
                             # Note: Folder is still marked as notified in Firestore to prevent retries
+                        
+                        # Start monitoring this folder
+                        start_folder_monitoring(folder_path, file_name)
                     else:
                         logger.debug(f"Folder already notified: {folder_path}")
+                        # Even if already notified, we might want to track this file for monitoring
+                        # Check if we're still monitoring this folder
+                        with monitored_folders_lock:
+                            if folder_path in monitored_folders:
+                                # Update monitoring with this new file
+                                monitored_folders[folder_path]["last_update"] = datetime.utcnow()
+                                monitored_folders[folder_path]["known_files"].add(file_name)
+                            else:
+                                # Folder was already notified but monitoring completed or never started
+                                # Check Firestore to see if final notification was sent
+                                doc_id = folder_path.replace("/", "_").replace("\\", "_")
+                                doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
+                                doc = doc_ref.get()
+                                
+                                if doc.exists and not doc.get("final_notification_sent"):
+                                    # Final notification not sent yet, start monitoring
+                                    start_folder_monitoring(folder_path, file_name)
                 else:
                     logger.debug(f"Empty folder path for file: {file_name}")
             else:
