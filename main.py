@@ -196,7 +196,7 @@ def send_slack_notification(folder_path: str, timestamp: str) -> bool:
             doc_id = folder_path.replace("/", "_").replace("\\", "_")
             if ts and channel:
                 _update_slack_metadata_with_retry(doc_id, ts, channel)
-            logger.info(f"Slack message posted with ts={ts} for folder: {folder_path}")
+            logger.info(f"Slack message posted with ts={ts} channel={channel} for folder: {folder_path}")
             return True
         except Exception as e:
             # Do NOT fallback to webhook when bot token is configured; avoid duplicate messages
@@ -286,6 +286,7 @@ def send_final_slack_notification(folder_path: str, file_count: int, total_size:
             doc = doc_ref.get()
             ts = (doc.exists and doc.get("slack_message_ts")) or None
             channel = (doc.exists and doc.get("slack_channel")) or SLACK_CHANNEL
+            logger.info(f"Preparing Slack edit: doc_exists={doc.exists} ts={ts} channel={channel} doc_id={doc_id}")
             if ts and channel:
                 _slack_api_post(
                     "chat.update",
@@ -298,6 +299,8 @@ def send_final_slack_notification(folder_path: str, file_count: int, total_size:
                 )
                 logger.info(f"Edited Slack message ts={ts} channel={channel} for folder: {folder_path} with file_count={file_count} total_size={total_size}")
                 return True
+            else:
+                logger.warning(f"Cannot edit Slack message: missing ts/channel for folder {folder_path}")
         except Exception as e:
             # Do NOT fallback to webhook when bot token is configured; avoid double messages
             logger.error(f"Failed to edit Slack message: {e}")
