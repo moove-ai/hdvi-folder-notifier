@@ -196,16 +196,20 @@ def get_folder_stats(folder_path: str) -> Tuple[int, int]:
     try:
         # List all blobs with the folder prefix (use client-level listing for robustness)
         prefix = f"{folder_path}/" if not folder_path.endswith("/") else folder_path
+        logger.info(f"Listing blobs for stats: bucket={BUCKET_NAME} prefix={prefix}")
         blobs = storage_client.list_blobs(BUCKET_NAME, prefix=prefix)
 
         jsonl_gz_count = 0
         total_size = 0
+        scanned = 0
 
         for blob in blobs:
+            scanned += 1
             # Count any files anywhere under the folder (including subfolders)
             if not blob.name.endswith('/') and blob.name.endswith('.jsonl.gz'):
                 jsonl_gz_count += 1
                 total_size += blob.size
+        logger.info(f"Folder stats listing complete: scanned={scanned} matched_jsonl_gz={jsonl_gz_count} total_size={total_size}")
         
         return jsonl_gz_count, total_size
     except Exception as e:
@@ -258,7 +262,7 @@ def send_final_slack_notification(folder_path: str, file_count: int, total_size:
                         "blocks": final_blocks,
                     },
                 )
-                logger.info(f"Edited Slack message ts={ts} for folder: {folder_path}")
+                logger.info(f"Edited Slack message ts={ts} channel={channel} for folder: {folder_path} with file_count={file_count} total_size={total_size}")
                 return True
         except Exception as e:
             logger.error(f"Failed to edit Slack message, will fallback to webhook: {e}")
@@ -269,7 +273,7 @@ def send_final_slack_notification(folder_path: str, file_count: int, total_size:
             message = {"text": f"✅ Folder upload complete: {folder_path}", "blocks": final_blocks}
             response = requests.post(SLACK_WEBHOOK_URL, json=message, timeout=10)
             response.raise_for_status()
-            logger.info(f"Final Slack notification sent (webhook) for folder: {folder_path}")
+            logger.info(f"Final Slack notification sent (webhook) for folder: {folder_path} with file_count={file_count} total_size={total_size}")
             return True
         except Exception as e:
             logger.error(f"Failed to send final Slack notification via webhook: {e}")
@@ -286,6 +290,7 @@ def check_folder_for_new_files(folder_path: str) -> bool:
     """
     try:
         prefix = f"{folder_path}/" if not folder_path.endswith("/") else folder_path
+        logger.debug(f"Checking folder for new files: bucket={BUCKET_NAME} prefix={prefix}")
         blobs = storage_client.list_blobs(BUCKET_NAME, prefix=prefix)
         
         with monitored_folders_lock:
@@ -295,7 +300,9 @@ def check_folder_for_new_files(folder_path: str) -> bool:
             known_files = monitored_folders[folder_path]["known_files"]
             found_new = False
             
+            scanned = 0
             for blob in blobs:
+                scanned += 1
                 # Consider any non-directory blob under the prefix
                 if not blob.name.endswith('/'):
                     if blob.name not in known_files:
@@ -305,6 +312,8 @@ def check_folder_for_new_files(folder_path: str) -> bool:
             
             if found_new:
                 monitored_folders[folder_path]["last_update"] = datetime.utcnow()
+            else:
+                logger.debug(f"No new files found. scanned={scanned} known_files={len(known_files)}")
             
             return found_new
     except Exception as e:
