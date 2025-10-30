@@ -24,15 +24,17 @@ spec:
         env:
         - name: GCP_PROJECT
           value: moove-data-pipelines
-        - name: SLACK_WEBHOOK_URL
-          valueFrom:
-            secretKeyRef:
-              name: hdvi-folder-notifier-slack-webhook
-              key: latest
         - name: BUCKET_NAME
           value: moove-incoming-data-u7x4ty
         - name: MONITORED_PREFIXES
           value: Prebind/,Postbind/,test/
+        - name: SLACK_CHANNEL
+          value: C0123456789   # your channel ID
+        - name: SLACK_BOT_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: hdvi-folder-notifier-slack-bot-token
+              key: latest
         
         resources:
           limits:
