@@ -130,8 +130,8 @@ def check_and_mark_final(transaction, folder_path: str, file_count: int, total_s
     doc_id = folder_path.replace("/", "_").replace("\\", "_")
     doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
     doc = doc_ref.get(transaction=transaction)
-
-    if doc.exists and doc.get("final_notification_sent"):
+    data = doc.to_dict() or {}
+    if doc.exists and data.get("final_notification_sent"):
         return False
 
     # Mark final as sent and store stats
@@ -284,8 +284,9 @@ def send_final_slack_notification(folder_path: str, file_count: int, total_size:
             doc_id = folder_path.replace("/", "_").replace("\\", "_")
             doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
             doc = doc_ref.get()
-            ts = (doc.exists and doc.get("slack_message_ts")) or None
-            channel = (doc.exists and doc.get("slack_channel")) or SLACK_CHANNEL
+            data = doc.to_dict() or {}
+            ts = (doc.exists and data.get("slack_message_ts")) or None
+            channel = (doc.exists and data.get("slack_channel")) or SLACK_CHANNEL
             logger.info(f"Preparing Slack edit: doc_exists={doc.exists} ts={ts} channel={channel} doc_id={doc_id}")
             if ts and channel:
                 _slack_api_post(
@@ -524,8 +525,8 @@ def handle_pubsub_push():
                                 doc_id = folder_path.replace("/", "_").replace("\\", "_")
                                 doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
                                 doc = doc_ref.get()
-                                
-                                if doc.exists and not doc.get("final_notification_sent"):
+                                data = doc.to_dict() or {}
+                                if doc.exists and not data.get("final_notification_sent"):
                                     # Final notification not sent yet, start monitoring
                                     start_folder_monitoring(folder_path, file_name)
                 else:
