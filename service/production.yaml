@@ -35,6 +35,10 @@ spec:
             secretKeyRef:
               name: hdvi-slack-notifier-bot-token
               key: latest
+        - name: ANALYTICS_BUCKET
+          value: moove-data-pipelines
+        - name: ANALYTICS_OBJECT
+          value: analytics/hdvi-folder-completions.csv
         
         resources:
           limits:
