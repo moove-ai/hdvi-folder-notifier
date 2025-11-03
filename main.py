@@ -1,10 +1,12 @@
 import base64
+import csv
 import json
 import os
 import logging
 import threading
 import time
 from datetime import datetime
+from io import StringIO
 from typing import Dict, Tuple
 from flask import Flask, request, jsonify
 import requests
@@ -333,9 +335,6 @@ def _append_completion_csv(folder_path: str, first_time: str, final_time_iso: st
         return
 
     try:
-        import csv
-        from io import StringIO
-
         bucket = storage_client.bucket(ANALYTICS_BUCKET)
         blob = bucket.blob(ANALYTICS_OBJECT)
 
@@ -345,35 +344,48 @@ def _append_completion_csv(folder_path: str, first_time: str, final_time_iso: st
         writer.writerow([folder_path, first_time or "", final_time_iso, str(file_count), str(total_size)])
         row_bytes = buf.getvalue()
 
+        # Try to check if object exists, but handle errors gracefully
+        object_exists = False
+        try:
+            object_exists = blob.exists()
+        except Exception as e:
+            logger.warning(f"Could not check CSV existence for {folder_path}: {e}, assuming new file")
+            object_exists = False
+
         # If object does not exist, write header + row
-        if not blob.exists():
-            header_buf = StringIO()
-            writer_h = csv.writer(header_buf)
-            writer_h.writerow(["folder_path", "first_notification_time", "final_notification_time", "file_count", "total_size_bytes"])
-            data = header_buf.getvalue() + row_bytes
-            blob.upload_from_string(data, content_type="text/csv")
-            logger.info(f"Created analytics CSV with first row for {folder_path}")
-            return
+        if not object_exists:
+            try:
+                header_buf = StringIO()
+                writer_h = csv.writer(header_buf)
+                writer_h.writerow(["folder_path", "first_notification_time", "final_notification_time", "file_count", "total_size_bytes"])
+                data = header_buf.getvalue() + row_bytes
+                blob.upload_from_string(data, content_type="text/csv")
+                logger.info(f"Created analytics CSV with first row for {folder_path}")
+                return
+            except Exception as e:
+                logger.error(f"Failed to create analytics CSV for {folder_path}: {e}")
+                return
 
         # Else: read-modify-write with generation precondition
         retries = 3
         for attempt in range(retries):
-            blob.reload()
-            gen = blob.generation
-            existing = blob.download_as_text()
-            new_data = existing + row_bytes
             try:
+                blob.reload()
+                gen = blob.generation
+                existing = blob.download_as_text()
+                new_data = existing + row_bytes
                 blob.upload_from_string(new_data, content_type="text/csv", if_generation_match=gen)
                 logger.info(f"Appended analytics CSV row for {folder_path}")
                 return
             except Exception as e:
                 if attempt < retries - 1:
+                    logger.debug(f"Retrying CSV append for {folder_path} (attempt {attempt + 1}/{retries}): {e}")
                     time.sleep(0.2)
                     continue
-                logger.error(f"Failed to append analytics CSV for {folder_path}: {e}")
+                logger.error(f"Failed to append analytics CSV for {folder_path} after {retries} attempts: {e}")
                 return
     except Exception as e:
-        logger.error(f"Analytics CSV error for {folder_path}: {e}")
+        logger.error(f"Analytics CSV error for {folder_path}: {e}", exc_info=True)
 
 
 def check_folder_for_new_files(folder_path: str) -> bool:
@@ -461,18 +473,22 @@ def monitor_folder(folder_path: str):
                 if should_send_final:
                     # Send final notification (edit or webhook depending on config)
                     send_final_slack_notification(folder_path, file_count, total_size)
-                    # Write analytics CSV (best-effort)
-                    try:
-                        # Retrieve first notification time from Firestore for row
-                        doc_id = folder_path.replace("/", "_").replace("\\", "_")
-                        doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
-                        doc = doc_ref.get()
-                        data = doc.to_dict() or {}
-                        first_time = data.get("first_notification_time") or ""
-                        final_time_iso = datetime.utcnow().isoformat()
-                        _append_completion_csv(folder_path, first_time, final_time_iso, file_count, total_size)
-                    except Exception as e:
-                        logger.error(f"Failed to write analytics CSV for {folder_path}: {e}")
+                    # Write analytics CSV (best-effort, in background thread)
+                    def write_csv_async():
+                        try:
+                            # Retrieve first notification time from Firestore for row
+                            doc_id = folder_path.replace("/", "_").replace("\\", "_")
+                            doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
+                            doc = doc_ref.get()
+                            data = doc.to_dict() or {}
+                            first_time = data.get("first_notification_time") or ""
+                            final_time_iso = datetime.utcnow().isoformat()
+                            _append_completion_csv(folder_path, first_time, final_time_iso, file_count, total_size)
+                        except Exception as e:
+                            logger.error(f"Failed to write analytics CSV for {folder_path}: {e}")
+                    
+                    csv_thread = threading.Thread(target=write_csv_async, daemon=True, name=f"csv-{folder_path}")
+                    csv_thread.start()
                 
                 # Else: another instance already sent the final, skip sending
                 
