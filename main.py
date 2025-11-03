@@ -582,19 +582,25 @@ def handle_pubsub_push():
 
                     if should_notify:
                         logger.info(f"New folder detected: {folder_path}")
-                        # Send Slack notification
-                        if send_slack_notification(folder_path, event_time):
-                            logger.info(f"Notification sent for folder: {folder_path}")
-                        else:
-                            logger.warning(f"Failed to send Slack notification for folder: {folder_path}")
-                            # Note: Folder is still marked as notified in Firestore to prevent retries
+                        # Send Slack notification in background to avoid blocking request
+                        def send_notification_async():
+                            try:
+                                if send_slack_notification(folder_path, event_time):
+                                    logger.info(f"Notification sent for folder: {folder_path}")
+                                else:
+                                    logger.warning(f"Failed to send Slack notification for folder: {folder_path}")
+                            except Exception as e:
+                                logger.error(f"Error sending Slack notification for {folder_path}: {e}")
                         
-                        # Start monitoring this folder
+                        notification_thread = threading.Thread(target=send_notification_async, daemon=True, name=f"notify-{folder_path}")
+                        notification_thread.start()
+                        
+                        # Start monitoring this folder (non-blocking)
                         start_folder_monitoring(folder_path, file_name)
                     else:
                         logger.debug(f"Folder already notified: {folder_path}")
                         # Even if already notified, we might want to track this file for monitoring
-                        # Check if we're still monitoring this folder
+                        # Check if we're still monitoring this folder (fast in-memory check)
                         with monitored_folders_lock:
                             if folder_path in monitored_folders:
                                 # Update monitoring with this new file
@@ -602,14 +608,21 @@ def handle_pubsub_push():
                                 monitored_folders[folder_path]["known_files"].add(file_name)
                             else:
                                 # Folder was already notified but monitoring completed or never started
-                                # Check Firestore to see if final notification was sent
-                                doc_id = folder_path.replace("/", "_").replace("\\", "_")
-                                doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
-                                doc = doc_ref.get()
-                                data = doc.to_dict() or {}
-                                if doc.exists and not data.get("final_notification_sent"):
-                                    # Final notification not sent yet, start monitoring
-                                    start_folder_monitoring(folder_path, file_name)
+                                # Check Firestore asynchronously to avoid blocking request
+                                def check_and_start_monitoring_async():
+                                    try:
+                                        doc_id = folder_path.replace("/", "_").replace("\\", "_")
+                                        doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
+                                        doc = doc_ref.get()
+                                        data = doc.to_dict() or {}
+                                        if doc.exists and not data.get("final_notification_sent"):
+                                            # Final notification not sent yet, start monitoring
+                                            start_folder_monitoring(folder_path, file_name)
+                                    except Exception as e:
+                                        logger.error(f"Error checking Firestore for monitoring {folder_path}: {e}")
+                                
+                                check_thread = threading.Thread(target=check_and_start_monitoring_async, daemon=True, name=f"check-{folder_path}")
+                                check_thread.start()
                 else:
                     logger.debug(f"Empty folder path for file: {file_name}")
             else:
