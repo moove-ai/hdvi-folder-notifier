@@ -360,7 +360,7 @@ def _append_completion_csv(folder_path: str, first_time: str, final_time_iso: st
                 writer_h.writerow(["folder_path", "first_notification_time", "final_notification_time", "file_count", "total_size_bytes"])
                 data = header_buf.getvalue() + row_bytes
                 blob.upload_from_string(data, content_type="text/csv")
-                logger.info(f"Created analytics CSV with first row for {folder_path}")
+                logger.info(f"Created analytics CSV with first row for {folder_path} at {ANALYTICS_BUCKET}/{ANALYTICS_OBJECT}")
                 return
             except Exception as e:
                 logger.error(f"Failed to create analytics CSV for {folder_path}: {e}")
@@ -375,7 +375,7 @@ def _append_completion_csv(folder_path: str, first_time: str, final_time_iso: st
                 existing = blob.download_as_text()
                 new_data = existing + row_bytes
                 blob.upload_from_string(new_data, content_type="text/csv", if_generation_match=gen)
-                logger.info(f"Appended analytics CSV row for {folder_path}")
+                logger.info(f"Appended analytics CSV row for {folder_path} to {ANALYTICS_BUCKET}/{ANALYTICS_OBJECT}")
                 return
             except Exception as e:
                 if attempt < retries - 1:
