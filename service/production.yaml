@@ -36,7 +36,7 @@ spec:
               name: hdvi-slack-notifier-bot-token
               key: latest
         - name: ANALYTICS_BUCKET
-          value: moove-data-pipelines
+          value: moove-incoming-hdvi-folder-tracking
         - name: ANALYTICS_OBJECT
           value: analytics/hdvi-folder-completions.csv
         
