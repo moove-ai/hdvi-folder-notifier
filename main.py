@@ -269,15 +269,25 @@ def format_size(size_bytes: int) -> str:
 def send_final_slack_notification(folder_path: str, file_count: int, total_size: int) -> bool:
     """Edit the original Slack message with final statistics when possible; else send a second message via webhook."""
     size_str = format_size(total_size)
+    
+    # Retrieve first notification time from Firestore to preserve original message fields
+    doc_id = folder_path.replace("/", "_").replace("\\", "_")
+    doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
+    doc = doc_ref.get()
+    data = doc.to_dict() or {}
+    first_time = data.get("first_notification_time") or "Unknown"
+    
+    # Keep original title and add statistics
     final_blocks = [
         {
             "type": "header",
-            "text": {"type": "plain_text", "text": "✅ HDVI Folder Upload Complete"},
+            "text": {"type": "plain_text", "text": "📁 New HDVI Data Folder"},
         },
         {
             "type": "section",
             "fields": [
                 {"type": "mrkdwn", "text": f"*Folder:*\n`{BUCKET_NAME}/{folder_path}`"},
+                {"type": "mrkdwn", "text": f"*First File Time:*\n{first_time}"},
                 {"type": "mrkdwn", "text": f"*JSONL.GZ Files:*\n{file_count}"},
                 {"type": "mrkdwn", "text": f"*Total Size:*\n{size_str}"},
             ],
@@ -287,10 +297,6 @@ def send_final_slack_notification(folder_path: str, file_count: int, total_size:
     # Prefer editing the original message when token/channel + ts exist
     if SLACK_BOT_TOKEN:
         try:
-            doc_id = folder_path.replace("/", "_").replace("\\", "_")
-            doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
-            doc = doc_ref.get()
-            data = doc.to_dict() or {}
             ts = (doc.exists and data.get("slack_message_ts")) or None
             channel = (doc.exists and data.get("slack_channel")) or SLACK_CHANNEL
             logger.info(f"Preparing Slack edit: doc_exists={doc.exists} ts={ts} channel={channel} doc_id={doc_id}")
