@@ -25,6 +25,7 @@ SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL = os.environ.get("SLACK_CHANNEL", "")
 BUCKET_NAME = os.environ.get("BUCKET_NAME", "moove-incoming-data-u7x4ty")
+OUTGOING_BUCKET_NAME = os.environ.get("OUTGOING_BUCKET_NAME", "moove-outgoing-data-u7x4ty")
 MONITORED_PREFIXES = os.environ.get("MONITORED_PREFIXES", "Prebind/,Postbind/,test/").split(",")
 
 # Optional analytics CSV sink in GCS
@@ -40,13 +41,14 @@ storage_client = storage.Client(project=PROJECT_ID)
 bucket_client = storage_client.bucket(BUCKET_NAME)
 
 # Folder monitoring state
-# Maps folder_path -> {"last_update": datetime, "known_files": set, "monitoring_thread": Thread}
+# Maps folder_path -> {"last_update": datetime, "known_files": set, "monitoring_thread": Thread, "processing_thread": Thread, "incoming_file_count": int}
 monitored_folders: Dict[str, Dict] = {}
 monitored_folders_lock = threading.Lock()
 
 # Monitoring configuration
 CHECK_INTERVAL_SECONDS = 15
 INACTIVITY_TIMEOUT_SECONDS = 60
+PROCESSING_CHECK_INTERVAL_SECONDS = 60  # Check processing progress every minute
 
 
 def _update_slack_metadata_with_retry(doc_id: str, ts: str, channel: str, retries: int = 3) -> None:
@@ -228,16 +230,27 @@ def send_slack_notification(folder_path: str, timestamp: str) -> bool:
         return False
 
 
-def get_folder_stats(folder_path: str) -> Tuple[int, int]:
+def get_outgoing_folder_path(incoming_folder_path: str) -> str:
+    """
+    Convert incoming folder path to outgoing folder path.
+    Pattern: {incoming_folder} -> contextualized/{incoming_folder}
+    Example: test/subfolder -> contextualized/test/subfolder
+    """
+    return f"contextualized/{incoming_folder_path}"
+
+
+def get_folder_stats(folder_path: str, bucket_name: str = None) -> Tuple[int, int]:
     """
     Get statistics for a folder.
     Returns: (count of jsonl.gz files, total size in bytes)
     """
+    if bucket_name is None:
+        bucket_name = BUCKET_NAME
     try:
         # List all blobs with the folder prefix (use client-level listing for robustness)
         prefix = f"{folder_path}/" if not folder_path.endswith("/") else folder_path
-        logger.info(f"Listing blobs for stats: bucket={BUCKET_NAME} prefix={prefix}")
-        blobs = storage_client.list_blobs(BUCKET_NAME, prefix=prefix)
+        logger.info(f"Listing blobs for stats: bucket={bucket_name} prefix={prefix}")
+        blobs = storage_client.list_blobs(bucket_name, prefix=prefix)
 
         jsonl_gz_count = 0
         total_size = 0
@@ -266,7 +279,7 @@ def format_size(size_bytes: int) -> str:
     return f"{size_bytes:.2f} PB"
 
 
-def send_final_slack_notification(folder_path: str, file_count: int, total_size: int) -> bool:
+def send_final_slack_notification(folder_path: str, file_count: int, total_size: int, processing_diff: int = None, check_time: str = None) -> bool:
     """Edit the original Slack message with final statistics when possible; else send a second message via webhook."""
     size_str = format_size(total_size)
     
@@ -277,6 +290,24 @@ def send_final_slack_notification(folder_path: str, file_count: int, total_size:
     data = doc.to_dict() or {}
     first_time = data.get("first_notification_time") or "Unknown"
     
+    # Build fields list
+    fields = [
+        {"type": "mrkdwn", "text": f"*Folder:*\n`{BUCKET_NAME}/{folder_path}`"},
+        {"type": "mrkdwn", "text": f"*First File Time:*\n{first_time}"},
+        {"type": "mrkdwn", "text": f"*JSONL.GZ Files:*\n{file_count}"},
+        {"type": "mrkdwn", "text": f"*Total Size:*\n{size_str}"},
+    ]
+    
+    # Add processing progress if provided
+    if processing_diff is not None:
+        if processing_diff == 0:
+            fields.append({"type": "mrkdwn", "text": f"*Processing Status:*\n✅ Complete (0 files remaining)"})
+        else:
+            fields.append({"type": "mrkdwn", "text": f"*Processing Status:*\n⏳ {processing_diff} files remaining"})
+    
+    if check_time:
+        fields.append({"type": "mrkdwn", "text": f"*Last Check:*\n{check_time}"})
+    
     # Keep original title and add statistics
     final_blocks = [
         {
@@ -285,12 +316,7 @@ def send_final_slack_notification(folder_path: str, file_count: int, total_size:
         },
         {
             "type": "section",
-            "fields": [
-                {"type": "mrkdwn", "text": f"*Folder:*\n`{BUCKET_NAME}/{folder_path}`"},
-                {"type": "mrkdwn", "text": f"*First File Time:*\n{first_time}"},
-                {"type": "mrkdwn", "text": f"*JSONL.GZ Files:*\n{file_count}"},
-                {"type": "mrkdwn", "text": f"*Total Size:*\n{size_str}"},
-            ],
+            "fields": fields,
         },
     ]
 
@@ -310,7 +336,7 @@ def send_final_slack_notification(folder_path: str, file_count: int, total_size:
                         "blocks": final_blocks,
                     },
                 )
-                logger.info(f"Edited Slack message ts={ts} channel={channel} for folder: {folder_path} with file_count={file_count} total_size={total_size}")
+                logger.info(f"Edited Slack message ts={ts} channel={channel} for folder: {folder_path} with file_count={file_count} total_size={total_size} processing_diff={processing_diff}")
                 return True
             else:
                 logger.warning(f"Cannot edit Slack message: missing ts/channel for folder {folder_path}")
@@ -432,10 +458,58 @@ def check_folder_for_new_files(folder_path: str) -> bool:
         return False
 
 
+def monitor_processing_progress(folder_path: str, incoming_file_count: int):
+    """
+    Monitor processing progress by comparing incoming and outgoing folder file counts.
+    Updates Slack message every minute with the difference.
+    Stops when difference is 0.
+    """
+    logger.info(f"Starting processing progress monitoring for folder: {folder_path} (incoming files: {incoming_file_count})")
+    outgoing_folder_path = get_outgoing_folder_path(folder_path)
+    
+    try:
+        while True:
+            time.sleep(PROCESSING_CHECK_INTERVAL_SECONDS)
+            
+            with monitored_folders_lock:
+                if folder_path not in monitored_folders:
+                    logger.info(f"Folder {folder_path} removed from processing monitoring")
+                    break
+            
+            # Get outgoing folder file count
+            outgoing_file_count, _ = get_folder_stats(outgoing_folder_path, OUTGOING_BUCKET_NAME)
+            processing_diff = incoming_file_count - outgoing_file_count
+            check_time = datetime.utcnow().isoformat()
+            
+            logger.info(f"Processing progress for {folder_path}: incoming={incoming_file_count} outgoing={outgoing_file_count} diff={processing_diff}")
+            
+            # Update Slack message with progress
+            # Get total size from Firestore or recalculate
+            doc_id = folder_path.replace("/", "_").replace("\\", "_")
+            doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
+            doc = doc_ref.get()
+            data = doc.to_dict() or {}
+            total_size = data.get("total_size_bytes", 0)
+            
+            send_final_slack_notification(folder_path, incoming_file_count, total_size, processing_diff, check_time)
+            
+            # Stop monitoring if all files are processed
+            if processing_diff == 0:
+                logger.info(f"All files processed for {folder_path}, stopping processing monitoring")
+                with monitored_folders_lock:
+                    monitored_folders.pop(folder_path, None)
+                break
+                
+    except Exception as e:
+        logger.error(f"Error in processing progress monitoring thread for {folder_path}: {e}", exc_info=True)
+        with monitored_folders_lock:
+            monitored_folders.pop(folder_path, None)
+
+
 def monitor_folder(folder_path: str):
     """
     Monitor a folder at 15-second intervals.
-    After 1 minute of inactivity, send final notification and stop monitoring.
+    After 1 minute of inactivity, send final notification and start processing progress monitoring.
     """
     logger.info(f"Starting monitoring for folder: {folder_path}")
     
@@ -495,14 +569,52 @@ def monitor_folder(folder_path: str):
                     
                     csv_thread = threading.Thread(target=write_csv_async, daemon=True, name=f"csv-{folder_path}")
                     csv_thread.start()
+                    
+                    # Start processing progress monitoring
+                    with monitored_folders_lock:
+                        if folder_path in monitored_folders:
+                            monitored_folders[folder_path]["incoming_file_count"] = file_count
+                            processing_thread = threading.Thread(
+                                target=monitor_processing_progress,
+                                args=(folder_path, file_count),
+                                daemon=True,
+                                name=f"processing-{folder_path}"
+                            )
+                            processing_thread.start()
+                            monitored_folders[folder_path]["processing_thread"] = processing_thread
+                            logger.info(f"Started processing progress monitoring for folder: {folder_path}")
                 
                 # Else: another instance already sent the final, skip sending
-                
-                # Remove from monitoring
+                # But we might still want to start processing monitoring if not already started
                 with monitored_folders_lock:
-                    monitored_folders.pop(folder_path, None)
+                    if folder_path in monitored_folders and "processing_thread" not in monitored_folders[folder_path]:
+                        # Another instance sent final, but we should still monitor processing
+                        if "incoming_file_count" not in monitored_folders[folder_path]:
+                            # Get file count from Firestore
+                            doc_id = folder_path.replace("/", "_").replace("\\", "_")
+                            doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
+                            doc = doc_ref.get()
+                            data = doc.to_dict() or {}
+                            file_count = data.get("file_count", 0)
+                            monitored_folders[folder_path]["incoming_file_count"] = file_count
+                        
+                        processing_thread = threading.Thread(
+                            target=monitor_processing_progress,
+                            args=(folder_path, monitored_folders[folder_path]["incoming_file_count"]),
+                            daemon=True,
+                            name=f"processing-{folder_path}"
+                        )
+                        processing_thread.start()
+                        monitored_folders[folder_path]["processing_thread"] = processing_thread
+                        logger.info(f"Started processing progress monitoring for folder: {folder_path} (final already sent)")
                 
-                logger.info(f"Stopped monitoring folder: {folder_path}")
+                # Remove from upload monitoring (but keep in dict for processing monitoring)
+                with monitored_folders_lock:
+                    if folder_path in monitored_folders:
+                        # Keep the entry but mark upload monitoring as done
+                        monitored_folders[folder_path]["upload_monitoring_done"] = True
+                
+                logger.info(f"Stopped upload monitoring for folder: {folder_path}, processing monitoring continues")
                 break
                 
     except Exception as e:
