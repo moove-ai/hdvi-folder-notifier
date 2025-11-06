@@ -17,6 +17,7 @@ from google.cloud import storage
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO))
 logger = logging.getLogger(__name__)
+logger.info(f"Logging configured with level: {LOG_LEVEL} (effective level: {logging.getLevelName(logger.level)})")
 
 app = Flask(__name__)
 
