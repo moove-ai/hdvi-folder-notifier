@@ -470,8 +470,13 @@ def monitor_processing_progress(folder_path: str, incoming_file_count: int):
     outgoing_folder_path = get_outgoing_folder_path(folder_path)
     
     try:
+        # Check immediately first (don't wait 60 seconds)
+        check_immediately = True
+        
         while True:
-            time.sleep(PROCESSING_CHECK_INTERVAL_SECONDS)
+            if not check_immediately:
+                time.sleep(PROCESSING_CHECK_INTERVAL_SECONDS)
+            check_immediately = False
             
             with monitored_folders_lock:
                 if folder_path not in monitored_folders:
