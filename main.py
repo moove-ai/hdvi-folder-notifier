@@ -690,8 +690,12 @@ def handle_pubsub_push():
             logger.info(f"Processing file: {bucket}/{file_name}")
 
             # Check if this is in a monitored path
-            if bucket == BUCKET_NAME and is_monitored_path(file_name):
+            is_monitored = is_monitored_path(file_name)
+            logger.debug(f"Bucket match: {bucket == BUCKET_NAME}, Is monitored: {is_monitored}, MONITORED_PREFIXES: {MONITORED_PREFIXES}")
+            
+            if bucket == BUCKET_NAME and is_monitored:
                 folder_path = get_folder_from_path(file_name)
+                logger.debug(f"Extracted folder_path: '{folder_path}' from file: {file_name}")
 
                 if folder_path:
                     # Atomically check and mark folder (prevents race conditions)
