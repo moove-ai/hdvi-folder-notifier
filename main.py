@@ -747,6 +747,20 @@ def handle_pubsub_push():
                                         if doc.exists and not data.get("final_notification_sent"):
                                             # Final notification not sent yet, start monitoring
                                             start_folder_monitoring(folder_path, file_name)
+                                        elif doc.exists and data.get("final_notification_sent"):
+                                            # Final notification was sent, but check if processing is actually complete
+                                            # This handles cases where the instance restarted before completion was detected
+                                            incoming_file_count = data.get("file_count", 0)
+                                            if incoming_file_count > 0:
+                                                outgoing_folder_path = get_outgoing_folder_path(folder_path)
+                                                outgoing_file_count, _ = get_folder_stats(outgoing_folder_path, OUTGOING_BUCKET_NAME)
+                                                processing_diff = incoming_file_count - outgoing_file_count
+                                                if processing_diff == 0:
+                                                    # Processing is complete but Slack might not be updated
+                                                    logger.info(f"Detected completed processing for {folder_path}, updating Slack")
+                                                    total_size = data.get("total_size_bytes", 0)
+                                                    check_time = datetime.utcnow().isoformat()
+                                                    send_final_slack_notification(folder_path, incoming_file_count, total_size, 0, check_time)
                                     except Exception as e:
                                         logger.error(f"Error checking Firestore for monitoring {folder_path}: {e}")
                                 
