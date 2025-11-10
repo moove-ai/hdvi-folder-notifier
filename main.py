@@ -1,13 +1,16 @@
 import base64
 import csv
+import gzip
 import json
 import os
 import logging
+import re
 import threading
 import time
+from collections import defaultdict
 from datetime import datetime
-from io import StringIO
-from typing import Dict, Tuple
+from io import StringIO, BytesIO
+from typing import Dict, Tuple, Set
 from flask import Flask, request, jsonify
 import requests
 from google.cloud import firestore
@@ -364,6 +367,168 @@ def send_final_slack_notification(folder_path: str, file_count: int, total_size:
     return False
 
 
+def _extract_date_from_path(file_path: str) -> str:
+    """
+    Extract date from file path.
+    Example: .../2025-01-01/... -> 2025-01-01
+    Returns YYYY-MM-DD or None if not found.
+    """
+    # Look for date pattern YYYY-MM-DD in the path
+    date_pattern = r'(\d{4}-\d{2}-\d{2})'
+    match = re.search(date_pattern, file_path)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _extract_vehicle_months_from_folder(folder_path: str) -> Dict[str, Set[str]]:
+    """
+    Process all JSONL.gz files in a folder and extract vehicle IDs and their months.
+    Returns: Dict mapping vehicle_id -> set of months (YYYY-MM format)
+    """
+    vehicle_months: Dict[str, Set[str]] = defaultdict(set)
+    
+    try:
+        # Use outgoing bucket since that's where processed files are
+        outgoing_folder_path = get_outgoing_folder_path(folder_path)
+        prefix = f"{outgoing_folder_path}/"
+        
+        logger.info(f"Analyzing vehicle data for folder: {folder_path}")
+        blobs = storage_client.list_blobs(OUTGOING_BUCKET_NAME, prefix=prefix)
+        
+        files_processed = 0
+        files_with_errors = 0
+        
+        for blob in blobs:
+            if not blob.name.endswith('.jsonl.gz'):
+                continue
+            
+            try:
+                # Extract date from path
+                date_str = _extract_date_from_path(blob.name)
+                if not date_str:
+                    logger.debug(f"Could not extract date from path: {blob.name}")
+                    continue
+                
+                # Convert date to YYYY-MM format
+                try:
+                    date_obj = datetime.strptime(date_str, '%Y-%m-%d')
+                    month_str = date_obj.strftime('%Y-%m')
+                except ValueError:
+                    logger.debug(f"Invalid date format: {date_str}")
+                    continue
+                
+                # Download and process the file
+                file_data = blob.download_as_bytes()
+                
+                # Decompress and read line by line
+                with gzip.open(BytesIO(file_data), 'rt', encoding='utf-8') as f:
+                    for line_num, line in enumerate(f, 1):
+                        try:
+                            if not line.strip():
+                                continue
+                            obj = json.loads(line)
+                            
+                            # Extract vehicle ID
+                            vehicle_id = None
+                            if isinstance(obj, dict):
+                                # Try nested path: input.vehicle
+                                vehicle_id = obj.get('input', {}).get('vehicle') if isinstance(obj.get('input'), dict) else None
+                                # Fallback: direct vehicle field
+                                if not vehicle_id:
+                                    vehicle_id = obj.get('vehicle')
+                            
+                            if vehicle_id:
+                                vehicle_months[vehicle_id].add(month_str)
+                        except json.JSONDecodeError as e:
+                            logger.debug(f"JSON decode error in {blob.name} line {line_num}: {e}")
+                            continue
+                        except Exception as e:
+                            logger.debug(f"Error processing line {line_num} in {blob.name}: {e}")
+                            continue
+                
+                files_processed += 1
+                if files_processed % 100 == 0:
+                    logger.debug(f"Processed {files_processed} files for vehicle analysis")
+                    
+            except Exception as e:
+                files_with_errors += 1
+                logger.warning(f"Error processing file {blob.name} for vehicle analysis: {e}")
+                continue
+        
+        logger.info(f"Vehicle analysis complete: {files_processed} files processed, {files_with_errors} errors, {len(vehicle_months)} unique vehicles")
+        
+    except Exception as e:
+        logger.error(f"Error extracting vehicle months for {folder_path}: {e}", exc_info=True)
+    
+    return vehicle_months
+
+
+def _generate_vehicle_analysis_csv(folder_path: str) -> str:
+    """
+    Generate CSV with vehicle IDs and their month counts.
+    Returns: CSV content as string
+    """
+    vehicle_months = _extract_vehicle_months_from_folder(folder_path)
+    
+    # Create CSV
+    buf = StringIO()
+    writer = csv.writer(buf)
+    
+    # Write header
+    writer.writerow(['vehicle_id', 'month_count'])
+    
+    # Write data sorted by vehicle_id
+    for vehicle_id in sorted(vehicle_months.keys()):
+        month_count = len(vehicle_months[vehicle_id])
+        writer.writerow([vehicle_id, str(month_count)])
+    
+    return buf.getvalue()
+
+
+def _upload_vehicle_analysis_csv(folder_path: str, csv_content: str) -> None:
+    """
+    Upload vehicle analysis CSV to GCS analytics bucket.
+    """
+    if not ANALYTICS_BUCKET:
+        logger.warning("ANALYTICS_BUCKET not configured, skipping vehicle analysis CSV upload")
+        return
+    
+    try:
+        # Create safe filename from folder path
+        safe_folder_name = folder_path.replace('/', '_').replace('\\', '_')
+        csv_filename = f"vehicle-analysis/{safe_folder_name}_vehicle_analysis.csv"
+        
+        bucket = storage_client.bucket(ANALYTICS_BUCKET)
+        blob = bucket.blob(csv_filename)
+        
+        blob.upload_from_string(csv_content, content_type='text/csv')
+        logger.info(f"Uploaded vehicle analysis CSV to gs://{ANALYTICS_BUCKET}/{csv_filename}")
+        
+    except Exception as e:
+        logger.error(f"Error uploading vehicle analysis CSV for {folder_path}: {e}", exc_info=True)
+
+
+def _generate_and_upload_vehicle_analysis(folder_path: str) -> None:
+    """
+    Generate and upload vehicle analysis CSV for a completed folder.
+    Runs asynchronously to avoid blocking.
+    """
+    def _do_analysis():
+        try:
+            logger.info(f"Starting vehicle analysis for folder: {folder_path}")
+            csv_content = _generate_vehicle_analysis_csv(folder_path)
+            if csv_content:
+                _upload_vehicle_analysis_csv(folder_path, csv_content)
+                logger.info(f"Completed vehicle analysis for folder: {folder_path}")
+        except Exception as e:
+            logger.error(f"Error in vehicle analysis for {folder_path}: {e}", exc_info=True)
+    
+    # Run in background thread to avoid blocking
+    analysis_thread = threading.Thread(target=_do_analysis, daemon=True, name=f"vehicle-analysis-{folder_path}")
+    analysis_thread.start()
+
+
 def _append_completion_csv(folder_path: str, first_time: str, final_time_iso: str, file_count: int, total_size: int) -> None:
     """Append a CSV row to GCS object with folder completion stats. Best-effort with generation precondition retries."""
     if not ANALYTICS_BUCKET or not ANALYTICS_OBJECT:
@@ -512,6 +677,8 @@ def monitor_processing_progress(folder_path: str, incoming_file_count: int):
                     logger.debug(f"Marked {folder_path} as processing_complete in Firestore")
                 except Exception as e:
                     logger.error(f"Failed to mark {folder_path} as complete in Firestore: {e}")
+                # Generate vehicle analysis CSV
+                _generate_and_upload_vehicle_analysis(folder_path)
                 with monitored_folders_lock:
                     monitored_folders.pop(folder_path, None)
                 break
@@ -761,7 +928,7 @@ def handle_pubsub_push():
                                             # This handles cases where the instance restarted before completion was detected
                                             # Skip if already marked as complete
                                             if data.get("processing_complete") is True:
-                                                continue
+                                                return
                                             incoming_file_count = data.get("file_count", 0)
                                             if incoming_file_count > 0:
                                                 outgoing_folder_path = get_outgoing_folder_path(folder_path)
@@ -779,6 +946,8 @@ def handle_pubsub_push():
                                                         logger.debug(f"Marked {folder_path} as processing_complete in Firestore")
                                                     except Exception as e:
                                                         logger.error(f"Failed to mark {folder_path} as complete in Firestore: {e}")
+                                                    # Generate vehicle analysis CSV
+                                                    _generate_and_upload_vehicle_analysis(folder_path)
                                     except Exception as e:
                                         logger.error(f"Error checking Firestore for monitoring {folder_path}: {e}")
                                 
@@ -866,6 +1035,8 @@ def periodic_completion_check():
                             logger.debug(f"Marked {folder_path} as processing_complete in Firestore")
                         except Exception as e:
                             logger.error(f"Failed to mark {folder_path} as complete in Firestore: {e}")
+                        # Generate vehicle analysis CSV
+                        _generate_and_upload_vehicle_analysis(folder_path)
                         updated_count += 1
                         
                 except Exception as e:
