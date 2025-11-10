@@ -1024,7 +1024,8 @@ def handle_pubsub_push():
                                             # Skip if already marked as complete
                                             if data.get("processing_complete") is True:
                                                 return
-                                            incoming_file_count = data.get("file_count", 0)
+                                            # Count actual incoming files (stored count may be outdated if files were added after inactivity timeout)
+                                            incoming_file_count, _ = get_folder_stats(folder_path, BUCKET_NAME)
                                             if incoming_file_count > 0:
                                                 outgoing_folder_path = get_outgoing_folder_path(folder_path)
                                                 outgoing_file_count, _ = get_folder_stats(outgoing_folder_path, OUTGOING_BUCKET_NAME)
@@ -1110,7 +1111,8 @@ def periodic_completion_check():
                                 skipped_monitored += 1
                                 continue
                         
-                        incoming_file_count = data.get("file_count", 0)
+                        # Count actual incoming files (stored count may be outdated if files were added after inactivity timeout)
+                        incoming_file_count, _ = get_folder_stats(folder_path, BUCKET_NAME)
                         if incoming_file_count == 0:
                             continue
                         
