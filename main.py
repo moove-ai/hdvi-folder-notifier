@@ -830,7 +830,8 @@ def monitor_folder(folder_path: str):
 
                 if should_send_final:
                     # Send final notification (edit or webhook depending on config)
-                    send_final_slack_notification(folder_path, file_count, total_size)
+                    check_time = datetime.utcnow().isoformat()
+                    send_final_slack_notification(folder_path, file_count, total_size, None, check_time)
                     # Write analytics CSV (best-effort, in background thread)
                     def write_csv_async():
                         try:
