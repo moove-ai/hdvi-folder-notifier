@@ -40,6 +40,7 @@ ANALYTICS_OBJECT = os.environ.get("ANALYTICS_OBJECT", "")
 # Initialize Firestore to track notified folders
 db = firestore.Client(project=PROJECT_ID)
 COLLECTION_NAME = "notified_folders"
+NEEDS_CHECK_COLLECTION = "folders_needing_check"  # Separate collection for folders that need periodic checking
 
 # Initialize GCS client
 storage_client = storage.Client(project=PROJECT_ID)
@@ -161,6 +162,20 @@ def check_and_mark_final(transaction, folder_path: str, file_count: int, total_s
         },
         merge=True,
     )
+    
+    # Add to folders_needing_check collection for efficient periodic checking
+    # This collection only contains folders that need checking, making queries much faster
+    needs_check_ref = db.collection(NEEDS_CHECK_COLLECTION).document(doc_id)
+    transaction.set(
+        needs_check_ref,
+        {
+            "folder_path": folder_path,
+            "file_count": file_count,
+            "total_size_bytes": total_size,
+            "added_at": firestore.SERVER_TIMESTAMP,
+        },
+    )
+    
     return True
 
 
@@ -675,6 +690,11 @@ def monitor_processing_progress(folder_path: str, incoming_file_count: int):
                     doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
                     doc_ref.update({"processing_complete": True})
                     logger.debug(f"Marked {folder_path} as processing_complete in Firestore")
+                    # Remove from folders_needing_check collection
+                    doc_id = folder_path.replace("/", "_").replace("\\", "_")
+                    needs_check_ref = db.collection(NEEDS_CHECK_COLLECTION).document(doc_id)
+                    needs_check_ref.delete()
+                    logger.debug(f"Removed {folder_path} from folders_needing_check collection")
                 except Exception as e:
                     logger.error(f"Failed to mark {folder_path} as complete in Firestore: {e}")
                 # Generate vehicle analysis CSV
@@ -942,8 +962,14 @@ def handle_pubsub_push():
                                                     send_final_slack_notification(folder_path, incoming_file_count, total_size, 0, check_time)
                                                     # Mark as complete in Firestore
                                                     try:
+                                                        doc_id = folder_path.replace("/", "_").replace("\\", "_")
+                                                        doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
                                                         doc_ref.update({"processing_complete": True})
                                                         logger.debug(f"Marked {folder_path} as processing_complete in Firestore")
+                                                        # Remove from folders_needing_check collection
+                                                        needs_check_ref = db.collection(NEEDS_CHECK_COLLECTION).document(doc_id)
+                                                        needs_check_ref.delete()
+                                                        logger.debug(f"Removed {folder_path} from folders_needing_check collection")
                                                     except Exception as e:
                                                         logger.error(f"Failed to mark {folder_path} as complete in Firestore: {e}")
                                                     # Generate vehicle analysis CSV
@@ -983,30 +1009,24 @@ def periodic_completion_check():
             time.sleep(COMPLETION_CHECK_INTERVAL_SECONDS)
             logger.info("Running periodic completion check for all folders")
             
-            # Query all folders that have final_notification_sent=True
-            # but processing_complete is not True (might be False, None, or missing)
-            # This filters out folders we already know are complete
-            # Use pagination to avoid timeout on large result sets
+            # Query folders_needing_check collection - only contains folders that need periodic checking
+            # This is much more efficient than querying all folders with final_notification_sent=True
+            # Folders are removed from this collection when processing_complete=True
             checked_count = 0
             updated_count = 0
-            skipped_complete = 0
             skipped_monitored = 0
             
             try:
-                # Query with a limit to avoid timeouts, process in batches
-                query = db.collection(COLLECTION_NAME).where("final_notification_sent", "==", True).limit(100)
-                docs = query.stream()
+                # Query the folders_needing_check collection - this only contains folders that need checking
+                # Much more efficient than querying all folders with final_notification_sent=True
+                query = db.collection(NEEDS_CHECK_COLLECTION).limit(100)
+                docs = query.stream(timeout=30)
                 
                 for doc in docs:
                     try:
                         data = doc.to_dict()
                         folder_path = data.get("folder_path", "")
                         if not folder_path:
-                            continue
-                        
-                        # Skip if already marked as complete
-                        if data.get("processing_complete") is True:
-                            skipped_complete += 1
                             continue
                         
                         # Skip if this folder is currently being monitored
@@ -1032,13 +1052,24 @@ def periodic_completion_check():
                             total_size = data.get("total_size_bytes", 0)
                             check_time = datetime.utcnow().isoformat()
                             send_final_slack_notification(folder_path, incoming_file_count, total_size, 0, check_time)
-                            # Mark as complete in Firestore
+                            
+                            # Mark as complete in main collection
                             try:
-                                doc_ref = db.collection(COLLECTION_NAME).document(doc.id)
+                                doc_id = folder_path.replace("/", "_").replace("\\", "_")
+                                doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
                                 doc_ref.update({"processing_complete": True})
                                 logger.debug(f"Marked {folder_path} as processing_complete in Firestore")
                             except Exception as e:
                                 logger.error(f"Failed to mark {folder_path} as complete in Firestore: {e}")
+                            
+                            # Remove from folders_needing_check collection (no longer needs checking)
+                            try:
+                                needs_check_ref = db.collection(NEEDS_CHECK_COLLECTION).document(doc.id)
+                                needs_check_ref.delete()
+                                logger.debug(f"Removed {folder_path} from folders_needing_check collection")
+                            except Exception as e:
+                                logger.error(f"Failed to remove {folder_path} from folders_needing_check: {e}")
+                            
                             # Generate vehicle analysis CSV
                             _generate_and_upload_vehicle_analysis(folder_path)
                             updated_count += 1
@@ -1047,7 +1078,7 @@ def periodic_completion_check():
                         logger.error(f"Error checking folder {doc.id} in periodic completion check: {e}")
                         continue
                 
-                logger.info(f"Periodic completion check: checked {checked_count} folders, updated {updated_count} Slack messages, skipped {skipped_complete} complete, {skipped_monitored} monitored")
+                logger.info(f"Periodic completion check: checked {checked_count} folders, updated {updated_count} Slack messages, skipped {skipped_monitored} monitored")
                 
             except Exception as e:
                 logger.error(f"Error querying Firestore in periodic completion check: {e}", exc_info=True)
