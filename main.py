@@ -8,7 +8,7 @@ import re
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import StringIO, BytesIO
 from typing import Dict, Tuple, Set
 from flask import Flask, request, jsonify
@@ -195,6 +195,9 @@ def _slack_api_post(path: str, payload: Dict) -> Dict:
 
 def send_slack_notification(folder_path: str, timestamp: str) -> bool:
     """Send initial notification to Slack. If bot token/channel are set, use chat.postMessage and store ts; else fallback to webhook."""
+    # Round timestamp to nearest second
+    timestamp_rounded = round_timestamp_to_second(timestamp)
+    
     blocks = [
         {
             "type": "header",
@@ -204,7 +207,7 @@ def send_slack_notification(folder_path: str, timestamp: str) -> bool:
             "type": "section",
             "fields": [
                 {"type": "mrkdwn", "text": f"*Folder:*\n`{BUCKET_NAME}/{folder_path}`"},
-                {"type": "mrkdwn", "text": f"*First File Time:*\n{timestamp}"},
+                {"type": "mrkdwn", "text": f"*First File Time:*\n{timestamp_rounded}"},
             ],
         },
     ]
@@ -300,6 +303,67 @@ def format_size(size_bytes: int) -> str:
     return f"{size_bytes:.2f} PB"
 
 
+def round_timestamp_to_second(iso_timestamp: str) -> str:
+    """Round an ISO timestamp to the nearest second."""
+    if not iso_timestamp or iso_timestamp == "Unknown":
+        return iso_timestamp
+    try:
+        # Parse ISO format (handles both with and without microseconds, with or without timezone)
+        timestamp_clean = iso_timestamp.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(timestamp_clean)
+        
+        # Round to nearest second
+        if dt.microsecond >= 500000:
+            dt = dt.replace(microsecond=0) + timedelta(seconds=1)
+        else:
+            dt = dt.replace(microsecond=0)
+        
+        # Return ISO format without microseconds
+        # Preserve timezone info if present, otherwise return naive datetime
+        result = dt.isoformat()
+        # Convert UTC timezone indicator back to Z for consistency
+        if result.endswith("+00:00"):
+            result = result.replace("+00:00", "Z")
+        return result
+    except (ValueError, AttributeError):
+        # If parsing fails, return as-is
+        return iso_timestamp
+
+
+def format_time_difference(first_time: str, last_time: str) -> str:
+    """Calculate and format the time difference between two ISO timestamps, rounded to nearest second."""
+    if not first_time or first_time == "Unknown" or not last_time:
+        return "Unknown"
+    try:
+        # Parse both timestamps, handling timezone-aware and naive datetimes
+        first_clean = first_time.replace("Z", "+00:00")
+        last_clean = last_time.replace("Z", "+00:00")
+        first_dt = datetime.fromisoformat(first_clean)
+        last_dt = datetime.fromisoformat(last_clean)
+        
+        # Calculate difference
+        diff = last_dt - first_dt
+        total_seconds = int(round(diff.total_seconds()))
+        
+        # Format as human-readable duration
+        if total_seconds < 60:
+            return f"{total_seconds}s"
+        elif total_seconds < 3600:
+            minutes = total_seconds // 60
+            seconds = total_seconds % 60
+            return f"{minutes}m {seconds}s"
+        elif total_seconds < 86400:
+            hours = total_seconds // 3600
+            minutes = (total_seconds % 3600) // 60
+            return f"{hours}h {minutes}m"
+        else:
+            days = total_seconds // 86400
+            hours = (total_seconds % 86400) // 3600
+            return f"{days}d {hours}h"
+    except (ValueError, AttributeError, TypeError):
+        return "Unknown"
+
+
 def send_final_slack_notification(folder_path: str, file_count: int, total_size: int, processing_diff: int = None, check_time: str = None) -> bool:
     """Edit the original Slack message with final statistics when possible; else send a second message via webhook."""
     size_str = format_size(total_size)
@@ -309,7 +373,16 @@ def send_final_slack_notification(folder_path: str, file_count: int, total_size:
     doc_ref = db.collection(COLLECTION_NAME).document(doc_id)
     doc = doc_ref.get()
     data = doc.to_dict() or {}
-    first_time = data.get("first_notification_time") or "Unknown"
+    first_time_raw = data.get("first_notification_time") or "Unknown"
+    
+    # Round timestamps to nearest second
+    first_time = round_timestamp_to_second(first_time_raw)
+    check_time_rounded = round_timestamp_to_second(check_time) if check_time else None
+    
+    # Calculate time difference if both times are available
+    time_diff = None
+    if first_time != "Unknown" and check_time_rounded:
+        time_diff = format_time_difference(first_time, check_time_rounded)
     
     # Build fields list
     fields = [
@@ -326,8 +399,10 @@ def send_final_slack_notification(folder_path: str, file_count: int, total_size:
         else:
             fields.append({"type": "mrkdwn", "text": f"*Processing Status:*\n⏳ {processing_diff} files remaining"})
     
-    if check_time:
-        fields.append({"type": "mrkdwn", "text": f"*Last Check:*\n{check_time}"})
+    if check_time_rounded:
+        fields.append({"type": "mrkdwn", "text": f"*Last Check:*\n{check_time_rounded}"})
+        if time_diff and time_diff != "Unknown":
+            fields.append({"type": "mrkdwn", "text": f"*Duration:*\n{time_diff}"})
     
     # Keep original title and add statistics
     final_blocks = [
