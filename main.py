@@ -812,7 +812,7 @@ def periodic_completion_check():
     while True:
         try:
             time.sleep(COMPLETION_CHECK_INTERVAL_SECONDS)
-            logger.debug("Running periodic completion check for all folders")
+            logger.info("Running periodic completion check for all folders")
             
             # Query all folders that have final_notification_sent=True
             # but processing_complete is not True (might be False, None, or missing)
@@ -821,6 +821,8 @@ def periodic_completion_check():
             
             checked_count = 0
             updated_count = 0
+            skipped_complete = 0
+            skipped_monitored = 0
             
             for doc in docs:
                 try:
@@ -831,11 +833,13 @@ def periodic_completion_check():
                     
                     # Skip if already marked as complete
                     if data.get("processing_complete") is True:
+                        skipped_complete += 1
                         continue
                     
                     # Skip if this folder is currently being monitored
                     with monitored_folders_lock:
                         if folder_path in monitored_folders:
+                            skipped_monitored += 1
                             continue
                     
                     incoming_file_count = data.get("file_count", 0)
@@ -868,8 +872,7 @@ def periodic_completion_check():
                     logger.error(f"Error checking folder {doc.id} in periodic completion check: {e}")
                     continue
             
-            if checked_count > 0:
-                logger.info(f"Periodic completion check: checked {checked_count} folders, updated {updated_count} Slack messages")
+            logger.info(f"Periodic completion check: checked {checked_count} folders, updated {updated_count} Slack messages, skipped {skipped_complete} complete, {skipped_monitored} monitored")
                 
         except Exception as e:
             logger.error(f"Error in periodic completion check thread: {e}", exc_info=True)
@@ -882,11 +885,37 @@ def warmup():
     return "OK", 200
 
 
-# Start periodic completion check thread when module loads
-# This ensures it runs in both local development and Cloud Run
-completion_check_thread = threading.Thread(target=periodic_completion_check, daemon=True, name="completion-checker")
-completion_check_thread.start()
-logger.info("Started periodic completion check thread")
+# Thread startup flag to ensure it only starts once
+_completion_check_thread_started = False
+_completion_check_thread_lock = threading.Lock()
+
+
+def _ensure_completion_check_thread():
+    """Ensure the periodic completion check thread is running."""
+    global _completion_check_thread_started
+    with _completion_check_thread_lock:
+        if not _completion_check_thread_started:
+            try:
+                completion_check_thread = threading.Thread(
+                    target=periodic_completion_check, 
+                    daemon=True, 
+                    name="completion-checker"
+                )
+                completion_check_thread.start()
+                _completion_check_thread_started = True
+                logger.info("Started periodic completion check thread")
+            except Exception as e:
+                logger.error(f"Failed to start periodic completion check thread: {e}", exc_info=True)
+
+
+# Start thread when module loads (works with both direct execution and gunicorn)
+# Also ensure it starts on first request as a fallback (for gunicorn workers)
+_ensure_completion_check_thread()
+
+# Fallback: ensure thread starts on first request (for gunicorn workers that might not execute module-level code)
+@app.before_request
+def ensure_thread_started():
+    _ensure_completion_check_thread()
 
 
 if __name__ == "__main__":
