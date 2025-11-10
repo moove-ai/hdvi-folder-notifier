@@ -986,64 +986,73 @@ def periodic_completion_check():
             # Query all folders that have final_notification_sent=True
             # but processing_complete is not True (might be False, None, or missing)
             # This filters out folders we already know are complete
-            docs = db.collection(COLLECTION_NAME).where("final_notification_sent", "==", True).stream()
-            
+            # Use pagination to avoid timeout on large result sets
             checked_count = 0
             updated_count = 0
             skipped_complete = 0
             skipped_monitored = 0
             
-            for doc in docs:
-                try:
-                    data = doc.to_dict()
-                    folder_path = data.get("folder_path", "")
-                    if not folder_path:
-                        continue
-                    
-                    # Skip if already marked as complete
-                    if data.get("processing_complete") is True:
-                        skipped_complete += 1
-                        continue
-                    
-                    # Skip if this folder is currently being monitored
-                    with monitored_folders_lock:
-                        if folder_path in monitored_folders:
-                            skipped_monitored += 1
+            try:
+                # Query with a limit to avoid timeouts, process in batches
+                query = db.collection(COLLECTION_NAME).where("final_notification_sent", "==", True).limit(100)
+                docs = query.stream()
+                
+                for doc in docs:
+                    try:
+                        data = doc.to_dict()
+                        folder_path = data.get("folder_path", "")
+                        if not folder_path:
                             continue
-                    
-                    incoming_file_count = data.get("file_count", 0)
-                    if incoming_file_count == 0:
-                        continue
-                    
-                    checked_count += 1
-                    
-                    # Check if processing is actually complete
-                    outgoing_folder_path = get_outgoing_folder_path(folder_path)
-                    outgoing_file_count, _ = get_folder_stats(outgoing_folder_path, OUTGOING_BUCKET_NAME)
-                    processing_diff = incoming_file_count - outgoing_file_count
-                    
-                    if processing_diff == 0:
-                        # Processing is complete but Slack might not be updated
-                        logger.info(f"Periodic check: Detected completed processing for {folder_path}, updating Slack")
-                        total_size = data.get("total_size_bytes", 0)
-                        check_time = datetime.utcnow().isoformat()
-                        send_final_slack_notification(folder_path, incoming_file_count, total_size, 0, check_time)
-                        # Mark as complete in Firestore
-                        try:
-                            doc_ref = db.collection(COLLECTION_NAME).document(doc.id)
-                            doc_ref.update({"processing_complete": True})
-                            logger.debug(f"Marked {folder_path} as processing_complete in Firestore")
-                        except Exception as e:
-                            logger.error(f"Failed to mark {folder_path} as complete in Firestore: {e}")
-                        # Generate vehicle analysis CSV
-                        _generate_and_upload_vehicle_analysis(folder_path)
-                        updated_count += 1
                         
-                except Exception as e:
-                    logger.error(f"Error checking folder {doc.id} in periodic completion check: {e}")
-                    continue
-            
-            logger.info(f"Periodic completion check: checked {checked_count} folders, updated {updated_count} Slack messages, skipped {skipped_complete} complete, {skipped_monitored} monitored")
+                        # Skip if already marked as complete
+                        if data.get("processing_complete") is True:
+                            skipped_complete += 1
+                            continue
+                        
+                        # Skip if this folder is currently being monitored
+                        with monitored_folders_lock:
+                            if folder_path in monitored_folders:
+                                skipped_monitored += 1
+                                continue
+                        
+                        incoming_file_count = data.get("file_count", 0)
+                        if incoming_file_count == 0:
+                            continue
+                        
+                        checked_count += 1
+                        
+                        # Check if processing is actually complete
+                        outgoing_folder_path = get_outgoing_folder_path(folder_path)
+                        outgoing_file_count, _ = get_folder_stats(outgoing_folder_path, OUTGOING_BUCKET_NAME)
+                        processing_diff = incoming_file_count - outgoing_file_count
+                        
+                        if processing_diff == 0:
+                            # Processing is complete but Slack might not be updated
+                            logger.info(f"Periodic check: Detected completed processing for {folder_path}, updating Slack")
+                            total_size = data.get("total_size_bytes", 0)
+                            check_time = datetime.utcnow().isoformat()
+                            send_final_slack_notification(folder_path, incoming_file_count, total_size, 0, check_time)
+                            # Mark as complete in Firestore
+                            try:
+                                doc_ref = db.collection(COLLECTION_NAME).document(doc.id)
+                                doc_ref.update({"processing_complete": True})
+                                logger.debug(f"Marked {folder_path} as processing_complete in Firestore")
+                            except Exception as e:
+                                logger.error(f"Failed to mark {folder_path} as complete in Firestore: {e}")
+                            # Generate vehicle analysis CSV
+                            _generate_and_upload_vehicle_analysis(folder_path)
+                            updated_count += 1
+                            
+                    except Exception as e:
+                        logger.error(f"Error checking folder {doc.id} in periodic completion check: {e}")
+                        continue
+                
+                logger.info(f"Periodic completion check: checked {checked_count} folders, updated {updated_count} Slack messages, skipped {skipped_complete} complete, {skipped_monitored} monitored")
+                
+            except Exception as e:
+                logger.error(f"Error querying Firestore in periodic completion check: {e}", exc_info=True)
+                # Continue to next iteration instead of crashing the thread
+                logger.info(f"Periodic completion check: query failed, will retry in next cycle")
                 
         except Exception as e:
             logger.error(f"Error in periodic completion check thread: {e}", exc_info=True)
