@@ -435,9 +435,9 @@ def send_final_slack_notification(folder_path: str, file_count: int, total_size:
         try:
             ts = (doc.exists and data.get("slack_message_ts")) or None
             channel = (doc.exists and data.get("slack_channel")) or SLACK_CHANNEL
-            logger.info(f"Preparing Slack edit: doc_exists={doc.exists} ts={ts} channel={channel} doc_id={doc_id}")
+            logger.info(f"Preparing Slack edit: doc_exists={doc.exists} ts={ts} channel={channel} doc_id={doc_id} folder={folder_path}")
             if ts and channel:
-                _slack_api_post(
+                result = _slack_api_post(
                     "chat.update",
                     {
                         "channel": channel,
@@ -446,13 +446,14 @@ def send_final_slack_notification(folder_path: str, file_count: int, total_size:
                         "blocks": final_blocks,
                     },
                 )
-                logger.info(f"Edited Slack message ts={ts} channel={channel} for folder: {folder_path} with file_count={file_count} total_size={total_size} processing_diff={processing_diff}")
+                logger.info(f"✅ Successfully edited Slack message ts={ts} channel={channel} for folder: {folder_path} (file_count={file_count} total_size={total_size} processing_diff={processing_diff})")
                 return True
             else:
-                logger.warning(f"Cannot edit Slack message: missing ts/channel for folder {folder_path}")
+                logger.warning(f"Cannot edit Slack message: missing ts={ts} or channel={channel} for folder {folder_path}")
+                return False
         except Exception as e:
             # Do NOT fallback to webhook when bot token is configured; avoid double messages
-            logger.error(f"Failed to edit Slack message: {e}")
+            logger.error(f"❌ Failed to edit Slack message for {folder_path}: {e}", exc_info=True)
             return False
 
     # Fallback: only when no bot token configured
@@ -1148,9 +1149,18 @@ def periodic_completion_check():
                         if processing_diff == 0:
                             # Processing is complete but Slack might not be updated
                             logger.info(f"Periodic check: Detected completed processing for {folder_path}, updating Slack")
-                            total_size = data.get("total_size_bytes", 0)
+                            
+                            # Recalculate total size from actual incoming files (stored count may be outdated)
+                            incoming_bucket = storage_client.bucket(BUCKET_NAME)
+                            incoming_blobs = list(incoming_bucket.list_blobs(prefix=f"{folder_path}/"))
+                            total_size = sum(b.size or 0 for b in incoming_blobs if b.name.endswith(".jsonl.gz"))
+                            
                             check_time = datetime.utcnow().isoformat()
-                            send_final_slack_notification(folder_path, incoming_file_count, total_size, 0, check_time)
+                            success = send_final_slack_notification(folder_path, incoming_file_count, total_size, 0, check_time)
+                            if not success:
+                                logger.error(f"Failed to update Slack message for {folder_path} in periodic check")
+                                # Don't mark as complete if Slack update failed - will retry next cycle
+                                continue
                             
                             # Mark as complete in main collection
                             try:
