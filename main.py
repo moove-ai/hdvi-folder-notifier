@@ -31,7 +31,10 @@ SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_CHANNEL = os.environ.get("SLACK_CHANNEL", "")
 BUCKET_NAME = os.environ.get("BUCKET_NAME", "moove-incoming-data-u7x4ty")
 OUTGOING_BUCKET_NAME = os.environ.get("OUTGOING_BUCKET_NAME", "moove-outgoing-data-u7x4ty")
-MONITORED_PREFIXES = os.environ.get("MONITORED_PREFIXES", "Prebind/,Postbind/,test/").split(",")
+# Normalize monitored prefixes to ensure they have trailing slashes for proper matching
+_raw_prefixes = os.environ.get("MONITORED_PREFIXES", "Prebind/,Postbind/,test/").split(",")
+MONITORED_PREFIXES = [p.strip() + "/" if p.strip() and not p.strip().endswith("/") else p.strip() for p in _raw_prefixes if p.strip()]
+logger.info(f"Configured MONITORED_PREFIXES: {MONITORED_PREFIXES}")
 
 # Optional analytics CSV sink in GCS
 ANALYTICS_BUCKET = os.environ.get("ANALYTICS_BUCKET", "")
@@ -1108,7 +1111,14 @@ def periodic_completion_check():
                 # Query the folders_needing_check collection - this only contains folders that need checking
                 # Much more efficient than querying all folders with final_notification_sent=True
                 query = db.collection(NEEDS_CHECK_COLLECTION).limit(100)
-                docs = query.stream(timeout=30)
+                
+                # Use a longer timeout and handle retry exceptions gracefully
+                try:
+                    docs = list(query.stream(timeout=60))
+                except Exception as query_error:
+                    logger.error(f"Error streaming Firestore query in periodic check: {query_error}", exc_info=True)
+                    # Continue to next iteration instead of crashing
+                    continue
                 
                 for doc in docs:
                     try:
