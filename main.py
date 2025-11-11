@@ -377,6 +377,17 @@ def send_final_slack_notification(folder_path: str, file_count: int, total_size:
     
     # Round timestamps to nearest second
     first_time = round_timestamp_to_second(first_time_raw)
+    
+    # Use provided check_time, or fall back to final_notification_time from Firestore
+    if not check_time:
+        final_notification_time = data.get("final_notification_time")
+        if final_notification_time:
+            # Convert Firestore timestamp to ISO string if needed
+            if hasattr(final_notification_time, 'isoformat'):
+                check_time = final_notification_time.isoformat()
+            else:
+                check_time = str(final_notification_time)
+    
     check_time_rounded = round_timestamp_to_second(check_time) if check_time else None
     
     # Calculate time difference if both times are available
