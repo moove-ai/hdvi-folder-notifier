@@ -27,7 +27,7 @@ spec:
         - name: BUCKET_NAME
           value: moove-incoming-data-u7x4ty
         - name: MONITORED_PREFIXES
-          value: Prebind/,Postbind/,PrebindBackfill/,PostbindBackfill/,test/
+          value: Prebind/,Postbind/,PrebindBackfill/,PostbindBackfill/,PostBind-PostJan15/,test/
         - name: SLACK_CHANNEL
           value: C09MKS35S74
         - name: SLACK_BOT_TOKEN
