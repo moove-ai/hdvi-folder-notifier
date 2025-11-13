@@ -8,7 +8,7 @@ import re
 import threading
 import time
 from collections import defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from io import StringIO, BytesIO
 from typing import Dict, Tuple, Set
 from flask import Flask, request, jsonify
@@ -35,6 +35,15 @@ OUTGOING_BUCKET_NAME = os.environ.get("OUTGOING_BUCKET_NAME", "moove-outgoing-da
 _raw_prefixes = os.environ.get("MONITORED_PREFIXES", "Prebind/,Postbind/,test/").split(",")
 MONITORED_PREFIXES = [p.strip() + "/" if p.strip() and not p.strip().endswith("/") else p.strip() for p in _raw_prefixes if p.strip()]
 logger.info(f"Configured MONITORED_PREFIXES: {MONITORED_PREFIXES}")
+
+# Folder reactivation controls (allows reusing long-lived folders when new files arrive later)
+FOLDER_REACTIVATION_ENABLED = os.environ.get("FOLDER_REACTIVATION_ENABLED", "true").lower() in ("1", "true", "yes", "y")
+FOLDER_REACTIVATION_COOLDOWN_SECONDS = int(os.environ.get("FOLDER_REACTIVATION_COOLDOWN_SECONDS", "0"))
+logger.info(
+    "Folder reactivation: enabled=%s cooldown_seconds=%s",
+    FOLDER_REACTIVATION_ENABLED,
+    FOLDER_REACTIVATION_COOLDOWN_SECONDS,
+)
 
 # Optional analytics CSV sink in GCS
 ANALYTICS_BUCKET = os.environ.get("ANALYTICS_BUCKET", "")
@@ -109,6 +118,53 @@ def is_monitored_path(file_path: str) -> bool:
     return any(file_path.startswith(prefix) for prefix in MONITORED_PREFIXES)
 
 
+def _parse_iso_timestamp(value):
+    """Parse ISO-8601 strings or datetime objects to timezone-aware UTC datetimes."""
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        if value.tzinfo:
+            return value.astimezone(timezone.utc)
+        return value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            cleaned = value.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(cleaned)
+            if dt.tzinfo:
+                return dt.astimezone(timezone.utc)
+            return dt.replace(tzinfo=timezone.utc)
+        except ValueError:
+            return None
+    return None
+
+
+def _should_reactivate_existing_folder(data: Dict, event_time: str) -> bool:
+    """Decide whether we can treat an existing folder as a fresh generation."""
+    if not FOLDER_REACTIVATION_ENABLED:
+        return False
+    if not data.get("processing_complete"):
+        return False
+    event_dt = _parse_iso_timestamp(event_time)
+    if not event_dt:
+        return True  # Conservative: allow reactivation if we cannot parse event time
+    last_start_iso = data.get("generation_start_time") or data.get("first_notification_time")
+    last_start_dt = _parse_iso_timestamp(last_start_iso)
+    if not last_start_dt:
+        return True
+    if event_dt <= last_start_dt:
+        return False
+    if FOLDER_REACTIVATION_COOLDOWN_SECONDS > 0:
+        delta = (event_dt - last_start_dt).total_seconds()
+        if delta < FOLDER_REACTIVATION_COOLDOWN_SECONDS:
+            logger.debug(
+                "Skipping reactivation for %s (delta %.2fs shorter than cooldown)",
+                data.get("folder_path"),
+                delta,
+            )
+            return False
+    return True
+
+
 @firestore.transactional
 def check_and_mark_folder(transaction, folder_path: str, timestamp: str) -> bool:
     """
@@ -121,7 +177,42 @@ def check_and_mark_folder(transaction, folder_path: str, timestamp: str) -> bool
     doc = doc_ref.get(transaction=transaction)
     
     if doc.exists:
-        return False  # Already notified
+        data = doc.to_dict() or {}
+        if _should_reactivate_existing_folder(data, timestamp):
+            new_generation = (data.get("generation") or 1) + 1
+            reactivation_count = (data.get("reactivation_count") or 0) + 1
+            logger.info(
+                "Reactivating folder %s (generation %s -> %s, reactivations=%s)",
+                folder_path,
+                data.get("generation", 1),
+                new_generation,
+                reactivation_count,
+            )
+            transaction.set(
+                doc_ref,
+                {
+                    "folder_path": folder_path,
+                    "doc_id": doc_id,
+                    "generation": new_generation,
+                    "reactivation_count": reactivation_count,
+                    "first_notification_time": timestamp,
+                    "generation_start_time": timestamp,
+                    "notified_at": firestore.SERVER_TIMESTAMP,
+                    "final_notification_sent": False,
+                    "final_notification_time": None,
+                    "file_count": 0,
+                    "total_size_bytes": 0,
+                    "processing_complete": False,
+                    # reset Slack linkage for the new message
+                    "slack_message_ts": None,
+                    "slack_channel": SLACK_CHANNEL or None,
+                },
+                merge=True,
+            )
+            needs_check_ref = db.collection(NEEDS_CHECK_COLLECTION).document(doc_id)
+            transaction.delete(needs_check_ref)
+            return True
+        return False  # Already notified and not eligible for reactivation
     
     # Mark as notified within the same transaction
     transaction.set(
@@ -129,8 +220,15 @@ def check_and_mark_folder(transaction, folder_path: str, timestamp: str) -> bool
         {
             "folder_path": folder_path,
             "doc_id": doc_id,
+            "generation": 1,
+            "reactivation_count": 0,
             "first_notification_time": timestamp,
+            "generation_start_time": timestamp,
             "notified_at": firestore.SERVER_TIMESTAMP,
+            "final_notification_sent": False,
+            "processing_complete": False,
+            "file_count": 0,
+            "total_size_bytes": 0,
             # Slack message linkage (optional, when using Slack Web API)
             "slack_message_ts": None,
             "slack_channel": SLACK_CHANNEL or None,
@@ -175,6 +273,7 @@ def check_and_mark_final(transaction, folder_path: str, file_count: int, total_s
             "folder_path": folder_path,
             "file_count": file_count,
             "total_size_bytes": total_size,
+            "generation": (doc.to_dict() or {}).get("generation", 1) if 'doc' in locals() else 1,
             "added_at": firestore.SERVER_TIMESTAMP,
         },
     )
