@@ -856,7 +856,7 @@ def monitor_processing_progress(folder_path: str, incoming_file_count: int):
             # Get outgoing folder file count
             outgoing_file_count, _ = get_folder_stats(outgoing_folder_path, OUTGOING_BUCKET_NAME)
             processing_diff = incoming_file_count - outgoing_file_count
-            check_time = datetime.utcnow().isoformat()
+            check_time = datetime.now(timezone.utc).isoformat()
             
             logger.info(f"Processing progress for {folder_path}: incoming={incoming_file_count} outgoing={outgoing_file_count} diff={processing_diff}")
             
@@ -944,7 +944,7 @@ def monitor_folder(folder_path: str):
 
                 if should_send_final:
                     # Send final notification (edit or webhook depending on config)
-                    check_time = datetime.utcnow().isoformat()
+                    check_time = datetime.now(timezone.utc).isoformat()
                     send_final_slack_notification(folder_path, file_count, total_size, None, check_time)
                     # Write analytics CSV (best-effort, in background thread)
                     def write_csv_async():
@@ -955,7 +955,7 @@ def monitor_folder(folder_path: str):
                             doc = doc_ref.get()
                             data = doc.to_dict() or {}
                             first_time = data.get("first_notification_time") or ""
-                            final_time_iso = datetime.utcnow().isoformat()
+                            final_time_iso = datetime.now(timezone.utc).isoformat()
                             _append_completion_csv(folder_path, first_time, final_time_iso, file_count, total_size)
                         except Exception as e:
                             logger.error(f"Failed to write analytics CSV for {folder_path}: {e}")
@@ -1078,7 +1078,7 @@ def handle_pubsub_push():
             # Extract file information from GCS notification
             file_name = data.get("name", "")
             bucket = data.get("bucket", "")
-            event_time = data.get("timeCreated", datetime.utcnow().isoformat())
+            event_time = data.get("timeCreated", datetime.now(timezone.utc).isoformat())
 
             logger.info(f"Processing file: {bucket}/{file_name}")
 
@@ -1149,7 +1149,7 @@ def handle_pubsub_push():
                                                     # Processing is complete but Slack might not be updated
                                                     logger.info(f"Detected completed processing for {folder_path}, updating Slack")
                                                     total_size = data.get("total_size_bytes", 0)
-                                                    check_time = datetime.utcnow().isoformat()
+                                                    check_time = datetime.now(timezone.utc).isoformat()
                                                     send_final_slack_notification(folder_path, incoming_file_count, total_size, 0, check_time)
                                                     # Mark as complete in Firestore
                                                     try:
@@ -1254,7 +1254,7 @@ def periodic_completion_check():
                             incoming_blobs = list(incoming_bucket.list_blobs(prefix=f"{folder_path}/"))
                             total_size = sum(b.size or 0 for b in incoming_blobs if b.name.endswith(".jsonl.gz"))
                             
-                            check_time = datetime.utcnow().isoformat()
+                            check_time = datetime.now(timezone.utc).isoformat()
                             success = send_final_slack_notification(folder_path, incoming_file_count, total_size, 0, check_time)
                             if not success:
                                 logger.error(f"Failed to update Slack message for {folder_path} in periodic check")
