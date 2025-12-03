@@ -10,7 +10,7 @@ import time
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from io import StringIO, BytesIO
-from typing import Dict, Tuple, Set
+from typing import Dict, Tuple, Set, Optional
 from flask import Flask, request, jsonify
 import requests
 from google.cloud import firestore
@@ -466,6 +466,15 @@ def format_time_difference(first_time: str, last_time: str) -> str:
         return "Unknown"
 
 
+def _duration_seconds(first_time: str, last_time: str) -> Optional[int]:
+    """Return integer seconds between timestamps, or None if unavailable."""
+    start_dt = _parse_iso_timestamp(first_time)
+    end_dt = _parse_iso_timestamp(last_time)
+    if not start_dt or not end_dt:
+        return None
+    return max(0, int(round((end_dt - start_dt).total_seconds())))
+
+
 def send_final_slack_notification(folder_path: str, file_count: int, total_size: int, processing_diff: int = None, check_time: str = None) -> bool:
     """Edit the original Slack message with final statistics when possible; else send a second message via webhook."""
     size_str = format_size(total_size)
@@ -494,28 +503,48 @@ def send_final_slack_notification(folder_path: str, file_count: int, total_size:
     
     # Calculate time difference if both times are available
     time_diff = None
-    if first_time != "Unknown" and check_time_rounded:
-        time_diff = format_time_difference(first_time, check_time_rounded)
+    time_diff_seconds = None
+    if first_time_raw not in (None, "Unknown") and check_time:
+        time_diff = format_time_difference(first_time, check_time_rounded) if check_time_rounded else None
+        time_diff_seconds = _duration_seconds(first_time_raw, check_time)
     
-    # Build fields list
-    fields = [
-        {"type": "mrkdwn", "text": f"*Folder:*\n`{BUCKET_NAME}/{folder_path}`"},
-        {"type": "mrkdwn", "text": f"*First File Time:*\n{first_time}"},
-        {"type": "mrkdwn", "text": f"*JSONL.GZ Files:*\n{file_count}"},
-        {"type": "mrkdwn", "text": f"*Total Size:*\n{size_str}"},
-    ]
+    def _format_time_per_gb() -> str:
+        if time_diff_seconds is None or total_size <= 0:
+            return "Unknown"
+        gb = total_size / (1024 ** 3)
+        if gb <= 0:
+            return "Unknown"
+        seconds_per_gb = time_diff_seconds / gb
+        if seconds_per_gb < 60:
+            return f"{seconds_per_gb:.1f}s/GB"
+        minutes = seconds_per_gb / 60.0
+        if minutes < 60:
+            return f"{minutes:.1f}m/GB"
+        hours = minutes / 60.0
+        return f"{hours:.1f}h/GB"
     
-    # Add processing progress if provided
-    if processing_diff is not None:
-        if processing_diff == 0:
-            fields.append({"type": "mrkdwn", "text": f"*Processing Status:*\n✅ Complete (0 files remaining)"})
-        else:
-            fields.append({"type": "mrkdwn", "text": f"*Processing Status:*\n⏳ {processing_diff} files remaining"})
+    completed = processing_diff is None or processing_diff == 0
     
-    if check_time_rounded:
-        fields.append({"type": "mrkdwn", "text": f"*Last Check:*\n{check_time_rounded}"})
-        if time_diff and time_diff != "Unknown":
-            fields.append({"type": "mrkdwn", "text": f"*Duration:*\n{time_diff}"})
+    if completed:
+        fields = [
+            {"type": "mrkdwn", "text": f"*Folder name:*\n`{BUCKET_NAME}/{folder_path}`"},
+            {"type": "mrkdwn", "text": f"*Duration:*\n{time_diff or 'Unknown'}"},
+            {"type": "mrkdwn", "text": f"*Number of files:*\n{file_count}"},
+            {"type": "mrkdwn", "text": f"*Size:*\n{size_str}"},
+            {"type": "mrkdwn", "text": f"*Time per GB:*\n{_format_time_per_gb()}"},
+        ]
+    else:
+        fields = [
+            {"type": "mrkdwn", "text": f"*Folder:*\n`{BUCKET_NAME}/{folder_path}`"},
+            {"type": "mrkdwn", "text": f"*First File Time:*\n{first_time}"},
+            {"type": "mrkdwn", "text": f"*JSONL.GZ Files:*\n{file_count}"},
+            {"type": "mrkdwn", "text": f"*Total Size:*\n{size_str}"},
+            {"type": "mrkdwn", "text": f"*Processing Status:*\n⏳ {processing_diff} files remaining"},
+        ]
+        if check_time_rounded:
+            fields.append({"type": "mrkdwn", "text": f"*Last Check:*\n{check_time_rounded}"})
+            if time_diff and time_diff != "Unknown":
+                fields.append({"type": "mrkdwn", "text": f"*Duration:*\n{time_diff}"})
     
     # Keep original title and add statistics
     final_blocks = [
