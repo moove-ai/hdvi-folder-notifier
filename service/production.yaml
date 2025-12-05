@@ -39,6 +39,12 @@ spec:
           value: moove-incoming-hdvi-folder-tracking
         - name: ANALYTICS_OBJECT
           value: analytics/hdvi-folder-completions.csv
+        - name: BIGQUERY_PROJECT_ID
+          value: moove-data-pipelines
+        - name: BIGQUERY_DATASET_ID
+          value: hdvi_folder_tracking
+        - name: BIGQUERY_TABLE_ID
+          value: folder_completions
         
         resources:
           limits:

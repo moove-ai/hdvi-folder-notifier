@@ -17,6 +17,11 @@ All configuration is managed via Terraform and passed as environment variables t
 |----------|---------|---------|---------|
 | `BUCKET_NAME` | `moove-incoming-data-u7x4ty` | GCS bucket to monitor | `your-bucket-name` |
 | `MONITORED_PREFIXES` | `Prebind/,Postbind/,test/` | Folder prefixes to monitor | `Folder1/,Folder2/` |
+| `ANALYTICS_BUCKET` | _(empty)_ | Optional bucket for CSV analytics log | `moove-incoming-hdvi-folder-tracking` |
+| `ANALYTICS_OBJECT` | _(empty)_ | Object path for analytics CSV | `analytics/hdvi-folder-completions.csv` |
+| `BIGQUERY_PROJECT_ID` | `GCP_PROJECT` | Project hosting the BigQuery dataset | `moove-data-pipelines` |
+| `BIGQUERY_DATASET_ID` | _(empty)_ | Dataset that stores completion stats | `hdvi_folder_tracking` |
+| `BIGQUERY_TABLE_ID` | _(empty)_ | Table name for completion stats | `folder_completions` |
 
 ## Customizing Configuration
 

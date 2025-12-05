@@ -15,6 +15,7 @@ from flask import Flask, request, jsonify
 import requests
 from google.cloud import firestore
 from google.cloud import storage
+from google.cloud import bigquery
 
 # Configure logging
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -49,6 +50,14 @@ logger.info(
 ANALYTICS_BUCKET = os.environ.get("ANALYTICS_BUCKET", "")
 ANALYTICS_OBJECT = os.environ.get("ANALYTICS_OBJECT", "")
 
+BIGQUERY_PROJECT_ID = os.environ.get("BIGQUERY_PROJECT_ID", PROJECT_ID)
+BIGQUERY_DATASET_ID = os.environ.get("BIGQUERY_DATASET_ID", "")
+BIGQUERY_TABLE_ID = os.environ.get("BIGQUERY_TABLE_ID", "")
+
+_bigquery_client = None
+_bigquery_disabled = False
+_bigquery_lock = threading.Lock()
+
 # Initialize Firestore to track notified folders
 db = firestore.Client(project=PROJECT_ID)
 COLLECTION_NAME = "notified_folders"
@@ -57,6 +66,34 @@ NEEDS_CHECK_COLLECTION = "folders_needing_check"  # Separate collection for fold
 # Initialize GCS client
 storage_client = storage.Client(project=PROJECT_ID)
 bucket_client = storage_client.bucket(BUCKET_NAME)
+
+
+def _get_bigquery_client():
+    """Initialize and cache the BigQuery client if configuration is provided."""
+    global _bigquery_client, _bigquery_disabled
+    if _bigquery_disabled:
+        return None
+    if not BIGQUERY_DATASET_ID or not BIGQUERY_TABLE_ID:
+        return None
+    if _bigquery_client is not None:
+        return _bigquery_client
+    with _bigquery_lock:
+        if _bigquery_client is not None:
+            return _bigquery_client
+        try:
+            project_id = BIGQUERY_PROJECT_ID or PROJECT_ID
+            _bigquery_client = bigquery.Client(project=project_id)
+            logger.info(
+                "Initialized BigQuery client: project=%s dataset=%s table=%s",
+                project_id,
+                BIGQUERY_DATASET_ID,
+                BIGQUERY_TABLE_ID,
+            )
+            return _bigquery_client
+        except Exception as e:
+            _bigquery_disabled = True
+            logger.error("Disabling BigQuery writes due to initialization failure: %s", e, exc_info=True)
+            return None
 
 # Folder monitoring state
 # Maps folder_path -> {"last_update": datetime, "known_files": set, "monitoring_thread": Thread, "processing_thread": Thread, "incoming_file_count": int}
@@ -475,6 +512,23 @@ def _duration_seconds(first_time: str, last_time: str) -> Optional[int]:
     return max(0, int(round((end_dt - start_dt).total_seconds())))
 
 
+def _compute_time_per_gb(time_diff_seconds: Optional[int], total_size: int) -> Tuple[str, Optional[float]]:
+    """Return human-readable time/GB along with the raw seconds/GB value."""
+    if time_diff_seconds is None or total_size <= 0:
+        return "Unknown", None
+    gb = total_size / (1024 ** 3)
+    if gb <= 0:
+        return "Unknown", None
+    seconds_per_gb = time_diff_seconds / gb
+    if seconds_per_gb < 60:
+        display = f"{seconds_per_gb:.1f}s/GB"
+    elif seconds_per_gb < 3600:
+        display = f"{seconds_per_gb / 60.0:.1f}m/GB"
+    else:
+        display = f"{seconds_per_gb / 3600.0:.1f}h/GB"
+    return display, seconds_per_gb
+
+
 def send_final_slack_notification(folder_path: str, file_count: int, total_size: int, processing_diff: int = None, check_time: str = None) -> bool:
     """Edit the original Slack message with final statistics when possible; else send a second message via webhook."""
     size_str = format_size(total_size)
@@ -507,22 +561,8 @@ def send_final_slack_notification(folder_path: str, file_count: int, total_size:
     if first_time_raw not in (None, "Unknown") and check_time:
         time_diff = format_time_difference(first_time, check_time_rounded) if check_time_rounded else None
         time_diff_seconds = _duration_seconds(first_time_raw, check_time)
-    
-    def _format_time_per_gb() -> str:
-        if time_diff_seconds is None or total_size <= 0:
-            return "Unknown"
-        gb = total_size / (1024 ** 3)
-        if gb <= 0:
-            return "Unknown"
-        seconds_per_gb = time_diff_seconds / gb
-        if seconds_per_gb < 60:
-            return f"{seconds_per_gb:.1f}s/GB"
-        minutes = seconds_per_gb / 60.0
-        if minutes < 60:
-            return f"{minutes:.1f}m/GB"
-        hours = minutes / 60.0
-        return f"{hours:.1f}h/GB"
-    
+    time_per_gb_display, _ = _compute_time_per_gb(time_diff_seconds, total_size)
+
     completed = processing_diff is None or processing_diff == 0
     
     if completed:
@@ -531,7 +571,7 @@ def send_final_slack_notification(folder_path: str, file_count: int, total_size:
             {"type": "mrkdwn", "text": f"*Duration:*\n{time_diff or 'Unknown'}"},
             {"type": "mrkdwn", "text": f"*Number of files:*\n{file_count}"},
             {"type": "mrkdwn", "text": f"*Size:*\n{size_str}"},
-            {"type": "mrkdwn", "text": f"*Time per GB:*\n{_format_time_per_gb()}"},
+            {"type": "mrkdwn", "text": f"*Time per GB:*\n{time_per_gb_display}"},
         ]
     else:
         fields = [
@@ -821,6 +861,60 @@ def _append_completion_csv(folder_path: str, first_time: str, final_time_iso: st
         logger.error(f"Analytics CSV error for {folder_path}: {e}", exc_info=True)
 
 
+def _write_bigquery_folder_completion(
+    folder_path: str,
+    generation: int,
+    reactivation_count: int,
+    first_time: str,
+    final_time_iso: str,
+    file_count: int,
+    total_size: int,
+    duration_seconds: Optional[int],
+    duration_display: str,
+    time_per_gb_seconds: Optional[float],
+    time_per_gb_display: str,
+) -> None:
+    """Best-effort write of completion stats to BigQuery for quick querying."""
+    client = _get_bigquery_client()
+    if not client:
+        return
+    try:
+        project_id = BIGQUERY_PROJECT_ID or PROJECT_ID
+        table_ref = f"{project_id}.{BIGQUERY_DATASET_ID}.{BIGQUERY_TABLE_ID}"
+        recorded_at = datetime.now(timezone.utc).isoformat()
+        doc_id = folder_path.replace("/", "_").replace("\\", "_")
+
+        row = {
+            "bucket": BUCKET_NAME,
+            "folder_path": folder_path,
+            "doc_id": doc_id,
+            "generation": generation or 1,
+            "reactivation_count": reactivation_count or 0,
+            "first_notification_time": first_time or None,
+            "final_notification_time": final_time_iso,
+            "file_count": file_count,
+            "total_size_bytes": total_size,
+            "duration_seconds": duration_seconds,
+            "duration_display": duration_display or "Unknown",
+            "time_per_gb_seconds": time_per_gb_seconds,
+            "time_per_gb_display": time_per_gb_display or "Unknown",
+            "recorded_at": recorded_at,
+        }
+
+        errors = client.insert_rows_json(table_ref, [row])
+        if errors:
+            raise RuntimeError(errors)
+        logger.info(
+            "Recorded completion stats in BigQuery for %s (generation=%s, files=%s, size=%s)",
+            folder_path,
+            generation or 1,
+            file_count,
+            total_size,
+        )
+    except Exception as e:
+        logger.error(f"Failed to write BigQuery completion row for {folder_path}: {e}", exc_info=True)
+
+
 def check_folder_for_new_files(folder_path: str) -> bool:
     """
     Check if there are new files in the folder since last check.
@@ -984,8 +1078,29 @@ def monitor_folder(folder_path: str):
                             doc = doc_ref.get()
                             data = doc.to_dict() or {}
                             first_time = data.get("first_notification_time") or ""
+                            generation = data.get("generation", 1)
+                            reactivation_count = data.get("reactivation_count", 0)
                             final_time_iso = datetime.now(timezone.utc).isoformat()
                             _append_completion_csv(folder_path, first_time, final_time_iso, file_count, total_size)
+                            duration_seconds = _duration_seconds(first_time, final_time_iso)
+                            duration_display = format_time_difference(
+                                round_timestamp_to_second(first_time) if first_time else "Unknown",
+                                round_timestamp_to_second(final_time_iso),
+                            )
+                            time_per_gb_display, time_per_gb_seconds = _compute_time_per_gb(duration_seconds, total_size)
+                            _write_bigquery_folder_completion(
+                                folder_path,
+                                generation,
+                                reactivation_count,
+                                first_time,
+                                final_time_iso,
+                                file_count,
+                                total_size,
+                                duration_seconds,
+                                duration_display,
+                                time_per_gb_seconds,
+                                time_per_gb_display,
+                            )
                         except Exception as e:
                             logger.error(f"Failed to write analytics CSV for {folder_path}: {e}")
                     
