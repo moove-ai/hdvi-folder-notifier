@@ -2,8 +2,6 @@ apiVersion: run.googleapis.com/v1
 kind: Job
 metadata:
   name: hdvi-folder-backfill
-  annotations:
-    run.googleapis.com/execution-environment: gen2
 spec:
   template:
     spec:
