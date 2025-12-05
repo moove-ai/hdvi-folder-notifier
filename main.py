@@ -36,6 +36,7 @@ OUTGOING_BUCKET_NAME = os.environ.get("OUTGOING_BUCKET_NAME", "moove-outgoing-da
 _raw_prefixes = os.environ.get("MONITORED_PREFIXES", "Prebind/,Postbind/,test/").split(",")
 MONITORED_PREFIXES = [p.strip() + "/" if p.strip() and not p.strip().endswith("/") else p.strip() for p in _raw_prefixes if p.strip()]
 logger.info(f"Configured MONITORED_PREFIXES: {MONITORED_PREFIXES}")
+DISABLE_COMPLETION_THREAD = os.environ.get("DISABLE_COMPLETION_THREAD", "false").lower() in ("1", "true", "yes", "y")
 
 # Folder reactivation controls (allows reusing long-lived folders when new files arrive later)
 FOLDER_REACTIVATION_ENABLED = os.environ.get("FOLDER_REACTIVATION_ENABLED", "true").lower() in ("1", "true", "yes", "y")
@@ -1455,6 +1456,9 @@ _completion_check_thread_lock = threading.Lock()
 
 def _ensure_completion_check_thread():
     """Ensure the periodic completion check thread is running."""
+    if DISABLE_COMPLETION_THREAD:
+        logger.debug("Completion check thread disabled via DISABLE_COMPLETION_THREAD")
+        return
     global _completion_check_thread_started
     with _completion_check_thread_lock:
         if not _completion_check_thread_started:
@@ -1473,12 +1477,14 @@ def _ensure_completion_check_thread():
 
 # Start thread when module loads (works with both direct execution and gunicorn)
 # Also ensure it starts on first request as a fallback (for gunicorn workers)
-_ensure_completion_check_thread()
+if not DISABLE_COMPLETION_THREAD:
+    _ensure_completion_check_thread()
 
 # Fallback: ensure thread starts on first request (for gunicorn workers that might not execute module-level code)
 @app.before_request
 def ensure_thread_started():
-    _ensure_completion_check_thread()
+    if not DISABLE_COMPLETION_THREAD:
+        _ensure_completion_check_thread()
 
 
 if __name__ == "__main__":

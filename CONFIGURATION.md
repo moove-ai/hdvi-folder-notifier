@@ -22,6 +22,9 @@ All configuration is managed via Terraform and passed as environment variables t
 | `BIGQUERY_PROJECT_ID` | `GCP_PROJECT` | Project hosting the BigQuery dataset | `moove-data-pipelines` |
 | `BIGQUERY_DATASET_ID` | _(empty)_ | Dataset that stores completion stats | `hdvi_folder_tracking` |
 | `BIGQUERY_TABLE_ID` | _(empty)_ | Table name for completion stats | `folder_completions` |
+| `DISABLE_COMPLETION_THREAD` | `false` | Skip periodic Firestore polling (set `true` for batch jobs) | `true` |
+| `BACKFILL_START_DATE` | _(empty)_ | Default ISO timestamp for manual BigQuery backfill jobs | `2025-11-09T00:00:00Z` |
+| `BACKFILL_END_DATE` | _(empty)_ | Optional exclusive end timestamp for backfill jobs | `2025-11-15T00:00:00Z` |
 
 ## Customizing Configuration
 
@@ -254,4 +257,40 @@ This would require changes to `main.py`.
 - Only the Slack webhook is sensitive (stored in Secret Manager)
 - Configuration changes require Cloud Run redeployment
 - Service account needs read access to the specified bucket
+
+## Manual BigQuery Backfill Job
+
+- Script entrypoint: `backfill_bigquery.py`
+- Cloud Run Job manifest: `jobs/hdvi-folder-backfill.yaml`
+- Default purpose: backfill folder completion stats starting 2025-11-09 into BigQuery
+
+### Deploy the Job
+
+```bash
+gcloud run jobs replace jobs/hdvi-folder-backfill.yaml \
+  --project moove-data-pipelines \
+  --region us-central1
+```
+
+### Execute the Job
+
+Override the window per run (CLI flags beat env vars):
+
+```bash
+gcloud run jobs execute hdvi-folder-backfill \
+  --project moove-data-pipelines \
+  --region us-central1 \
+  --args="--start-date=2025-11-09T00:00:00Z","--end-date=2025-11-16T00:00:00Z"
+```
+
+Dry run without inserting rows:
+
+```bash
+gcloud run jobs execute hdvi-folder-backfill \
+  --project moove-data-pipelines \
+  --region us-central1 \
+  --args="--start-date=2025-11-09","--dry-run"
+```
+
+Backfill script also honors `BACKFILL_START_DATE` / `BACKFILL_END_DATE` env vars, and sets `DISABLE_COMPLETION_THREAD=true` so the batch container skips long-running monitor threads.
 

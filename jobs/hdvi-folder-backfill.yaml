@@ -1,0 +1,42 @@
+apiVersion: run.googleapis.com/v1
+kind: Job
+metadata:
+  name: hdvi-folder-backfill
+  annotations:
+    run.googleapis.com/execution-environment: gen2
+spec:
+  template:
+    spec:
+      taskCount: 1
+      template:
+        spec:
+          serviceAccountName: moove-data-pipelines@appspot.gserviceaccount.com
+          containers:
+            - image: us-docker.pkg.dev/moove-build/docker-us/hdvi-folder-notifier:latest
+              command:
+                - python
+                - backfill_bigquery.py
+              env:
+                - name: GCP_PROJECT
+                  value: moove-data-pipelines
+                - name: BUCKET_NAME
+                  value: moove-incoming-data-u7x4ty
+                - name: OUTGOING_BUCKET_NAME
+                  value: moove-outgoing-data-u7x4ty
+                - name: MONITORED_PREFIXES
+                  value: Prebind/,Postbind/,PrebindBackfill/,PostbindBackfill/,PostBind-PostJan15/,test/
+                - name: BIGQUERY_PROJECT_ID
+                  value: moove-data-pipelines
+                - name: BIGQUERY_DATASET_ID
+                  value: hdvi_folder_tracking
+                - name: BIGQUERY_TABLE_ID
+                  value: folder_completions
+                - name: BACKFILL_START_DATE
+                  value: "2025-11-09T00:00:00Z"
+                - name: BACKFILL_END_DATE
+                  value: ""
+                - name: DISABLE_COMPLETION_THREAD
+                  value: "true"
+          timeoutSeconds: 3600
+          maxRetries: 0
+
